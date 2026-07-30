@@ -3686,7 +3686,11 @@ impl HomeView {
             .instances
             .values()
             .filter(|inst| {
-                let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+                let session_name = crate::tmux::resolve_agent_session_name_in(
+                    &pane_meta,
+                    &inst.id,
+                    &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+                );
                 let has_live_tmux = pane_meta
                     .get(&session_name)
                     .map(|m| !m.pane_dead)
@@ -5119,10 +5123,10 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::Terminal => crate::tmux::Session::from_name(
-                &crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title),
+                &crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title),
             ),
             live_send::LiveSendTarget::ContainerTerminal => crate::tmux::Session::from_name(
-                &crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title),
+                &crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title),
             ),
             live_send::LiveSendTarget::Tool(name) => crate::tmux::Session::from_name(
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name).session_name(),
@@ -5284,10 +5288,10 @@ impl HomeView {
         let tmux_name = match &self.pending_live_send_target {
             live_send::LiveSendTarget::Agent => return self.agent_pane_is_warm(session_id),
             live_send::LiveSendTarget::Terminal => {
-                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Tool(name) => {
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
@@ -5438,10 +5442,10 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::Terminal => {
-                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Tool(name) => {
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
