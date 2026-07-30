@@ -2236,9 +2236,16 @@ impl HomeView {
                 // always overwrite, falling back to an empty body (the same
                 // "session looks gone" signal the non-live path uses).
                 let same_session = s.preview_cache.session_id.as_deref() == Some(id);
+                // Composited in BOTH modes, matching what the worker publishes.
+                // This fallback also runs on every idle refresh (the worker
+                // dedups unchanged frames, so it has nothing to hand over), so a
+                // pane-0-only capture here would clobber the worker's composite
+                // a beat after each keystroke and leave the split visible for
+                // only one frame at a time. On an unsplit window this returns
+                // the pane bytes verbatim, so nothing changes there.
                 let fork_capture = s
                     .get_instance(id)
-                    .and_then(|inst| inst.capture_output(capture_lines).ok());
+                    .and_then(|inst| inst.capture_output_composited(capture_lines).ok());
                 if in_live {
                     match fork_capture {
                         Some(content) if !content.is_empty() => Some(content),
@@ -2273,7 +2280,7 @@ impl HomeView {
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
                     inst.terminal_tmux_session()
-                        .and_then(|sess| sess.capture_pane(capture_lines))
+                        .and_then(|sess| sess.capture_window_composited(capture_lines))
                         .unwrap_or_default()
                 })
             },
@@ -2302,7 +2309,7 @@ impl HomeView {
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
                     inst.container_terminal_tmux_session()
-                        .and_then(|sess| sess.capture_pane(capture_lines))
+                        .and_then(|sess| sess.capture_window_composited(capture_lines))
                         .unwrap_or_default()
                 })
             },
@@ -2336,7 +2343,7 @@ impl HomeView {
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
                     crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name)
-                        .capture_pane(capture_lines)
+                        .capture_window_composited(capture_lines)
                         .unwrap_or_default()
                 })
             },
@@ -4020,6 +4027,7 @@ mod tests {
             mouse_sgr: false,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         }
     }
 
