@@ -9,7 +9,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::cli::truncate_id;
 use crate::containers::{self, DockerContainer};
 use crate::tmux;
 
@@ -1251,7 +1250,6 @@ fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
 }
 
 fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
-    let suffix = format!("_{}", truncate_id(instance_id, 8));
     let output = crate::tmux::tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
@@ -1259,28 +1257,8 @@ fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-
-    let mut agent = None;
-    let mut terminal = None;
-    let mut container = None;
-    for name in String::from_utf8_lossy(&output.stdout).lines() {
-        if !name.ends_with(&suffix)
-            || name.starts_with(tmux::TOOL_PREFIX)
-            || crate::tmux::utils::is_pane_dead(name)
-        {
-            continue;
-        }
-
-        if name.starts_with(tmux::TERMINAL_PREFIX) {
-            terminal.get_or_insert_with(|| name.to_string());
-        } else if name.starts_with(tmux::CONTAINER_TERMINAL_PREFIX) {
-            container.get_or_insert_with(|| name.to_string());
-        } else if name.starts_with(tmux::SESSION_PREFIX) {
-            agent.get_or_insert_with(|| name.to_string());
-        }
-    }
-
-    agent.or(terminal).or(container)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    crate::tmux::live_any_kind_name_for_id(stdout.lines(), instance_id)
 }
 
 /// A passively-detected status transition, queued for a batched disk write.
@@ -4876,9 +4854,13 @@ impl Instance {
     /// guard shape (baseline vs. newly detected). Every call re-seeds the
     /// baseline at exit, so the next call compares against a value this
     /// method itself wrote.
-    pub fn update_status_with_metadata(&mut self, metadata: Option<&tmux::PaneMetadata>) {
+    pub fn update_status_with_metadata(
+        &mut self,
+        metadata: Option<&tmux::PaneMetadata>,
+        resolved_name: Option<&str>,
+    ) {
         let baseline = self.live_status_baseline;
-        self.update_status_with_metadata_inner(metadata);
+        self.update_status_with_metadata_inner(metadata, resolved_name);
         if let Some(prev) = baseline {
             if prev != self.status {
                 self.log_status_transition(prev);
@@ -4940,7 +4922,11 @@ impl Instance {
         }
     }
 
-    fn update_status_with_metadata_inner(&mut self, metadata: Option<&tmux::PaneMetadata>) {
+    fn update_status_with_metadata_inner(
+        &mut self,
+        metadata: Option<&tmux::PaneMetadata>,
+        resolved_name: Option<&str>,
+    ) {
         if matches!(
             self.status,
             Status::Stopped | Status::Deleting | Status::Creating
@@ -4990,22 +4976,25 @@ impl Instance {
             }
         }
 
-        let session = match self.tmux_session() {
-            Ok(s) => s,
-            Err(_) => {
-                tracing::trace!(target: "session.store",
-                    "status '{}': tmux_session() failed, setting Error",
-                    self.title
-                );
-                self.status = Status::Error;
-                if self.last_error.is_none() {
-                    self.last_error = Some(
-                        "Could not reach tmux. Is tmux still running on the host?".to_string(),
+        let session = match resolved_name {
+            Some(name) => tmux::Session::from_name(name),
+            None => match self.tmux_session() {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::trace!(target: "session.store",
+                        "status '{}': tmux_session() failed, setting Error",
+                        self.title
                     );
+                    self.status = Status::Error;
+                    if self.last_error.is_none() {
+                        self.last_error = Some(
+                            "Could not reach tmux. Is tmux still running on the host?".to_string(),
+                        );
+                    }
+                    self.last_error_check = Some(std::time::Instant::now());
+                    return;
                 }
-                self.last_error_check = Some(std::time::Instant::now());
-                return;
-            }
+            },
         };
 
         match session.existence() {
@@ -5247,7 +5236,7 @@ impl Instance {
     }
 
     pub fn update_status(&mut self) {
-        self.update_status_with_metadata(None);
+        self.update_status_with_metadata(None, None);
     }
 
     /// Capture the session's window for the preview, with any panes the user
@@ -5827,7 +5816,7 @@ mod tests {
         // Red on the pre-fix tree, where the tmux probe stamps Error.
         let mut inst = Instance::new("test", "/tmp/test");
         inst.archive();
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         assert_ne!(inst.status, Status::Error);
         assert_eq!(inst.status, Status::Idle);
         assert_eq!(inst.last_error, None);
@@ -5843,7 +5832,7 @@ mod tests {
         inst.archive();
         inst.status = Status::Error;
         inst.last_error = Some("agent crashed".to_string());
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
     }
@@ -5858,9 +5847,9 @@ mod tests {
         inst.archive();
         inst.status = Status::Error;
         inst.last_error = Some("agent crashed".to_string());
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         inst.unarchive();
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
     }
@@ -5882,11 +5871,44 @@ mod tests {
         // name is not in it: a confirmed-absent session.
         guard.force_present(&["some_other_session"]);
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some(TMUX_SESSION_GONE_ERROR));
         assert!(inst.last_error_check.is_some());
+    }
+
+    /// R2: the poller / serve / ps loops resolve the session's live tmux name
+    /// once against the batch snapshot; the status probe must act on that name
+    /// instead of resolving the id a second time from the (possibly stale)
+    /// title. A live name the title could never derive proves which path ran:
+    /// only the resolved-name path can confirm it present.
+    #[test]
+    #[serial_test::serial]
+    fn update_status_probes_the_resolved_name_not_the_title() {
+        let resolved = format!("{}live_elsewhere_00000000", crate::tmux::SESSION_PREFIX);
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[resolved.as_str()]);
+
+        let mut inst = Instance::new("resolve-r2", "/tmp/resolve-r2");
+        inst.status = Status::Running;
+        inst.update_status_with_metadata_inner(None, Some(&resolved));
+        assert!(
+            inst.ever_confirmed_present,
+            "the passed resolved name must be the one probed"
+        );
+        assert_ne!(inst.status, Status::Error);
+
+        let mut untold = Instance::new("resolve-r2", "/tmp/resolve-r2");
+        untold.status = Status::Running;
+        untold.update_status_with_metadata_inner(None, None);
+        assert_eq!(
+            untold.status,
+            Status::Error,
+            "without the resolved name the title-derived name is absent from the cache"
+        );
+        assert_eq!(untold.last_error.as_deref(), Some(TMUX_SESSION_GONE_ERROR));
     }
 
     /// A tmux-server-unreachable probe (`SessionExistence::Unknown`) must not
@@ -5906,7 +5928,7 @@ mod tests {
         // connection), not a confirmed-absent session.
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Running);
         assert_eq!(inst.last_error, None);
@@ -5931,7 +5953,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
@@ -5961,7 +5983,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Error);
         assert_eq!(
@@ -5990,7 +6012,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Idle);
         assert_eq!(inst.last_error, None);
@@ -6015,7 +6037,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Running);
         assert_eq!(inst.last_error, None);
@@ -6046,7 +6068,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Error);
         assert_eq!(
@@ -6073,7 +6095,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_present(&[name.as_str()]);
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert!(inst.ever_confirmed_present);
         assert_eq!(inst.unknown_since, None);
@@ -7259,7 +7281,7 @@ mod tests {
         // socket, making the test schedule-dependent and flaky (#2936).
         let _cache = force_session_absent();
 
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
 
         // Detection confirms the session Absent, resolving to Error, which
         // differs from the stale disk `Starting`. That mismatch must NOT be
@@ -7296,7 +7318,7 @@ mod tests {
         let _cache = force_session_absent();
 
         let before = Utc::now();
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         let after = Utc::now();
 
         // Detection confirms the session Absent, resolving to Error: a
@@ -7327,7 +7349,7 @@ mod tests {
         // (see #2936; without this the outcome is schedule-dependent).
         let _cache = force_session_absent();
 
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(
             inst.idle_entered_at, sentinel_idle,
@@ -7338,7 +7360,7 @@ mod tests {
             "first call must not restamp"
         );
 
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(
             inst.idle_entered_at, sentinel_idle,
@@ -7366,7 +7388,7 @@ mod tests {
         inst.status = Status::Running;
 
         let before1 = Utc::now();
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         let after1 = Utc::now();
         assert_eq!(
             inst.status,
@@ -7382,7 +7404,7 @@ mod tests {
 
         inst.status = Status::Idle;
         let before2 = Utc::now();
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         let after2 = Utc::now();
         assert_eq!(inst.status, Status::Idle);
         let second_idle = inst
@@ -7441,7 +7463,7 @@ mod tests {
         // being the canonical one (`src/session/instance.rs`).
         inst.status = Status::Starting;
 
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
 
         assert_eq!(
             inst.last_accessed_at, None,
