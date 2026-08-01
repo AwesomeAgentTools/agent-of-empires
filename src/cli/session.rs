@@ -1622,18 +1622,26 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         let mut live = inst.clone();
         crate::tmux::refresh_session_cache();
         live.update_status();
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
         // A sandbox session's container keeps the worktree dir mounted even
-        // while the agent is Idle, so `git worktree move` would fail with
-        // EBUSY; stopping the session tears the container down and releases it.
+        // while the agent is Idle, so `git worktree move` would fail. The gate
+        // drops a merely-stopped container to free the mount and only reports
+        // held for a live one, which the user has to stop. Gated on the
+        // directory actually moving so a branch-only rename does not discard a
+        // container for a move that never happens.
+        let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+            std::path::Path::new(&current_path),
+            &leaf,
+        );
         if live.status.blocks_worktree_edit()
-            || crate::session::worktree_edit::sandbox_container_holds_worktree(
-                &id,
-                live.is_sandboxed(),
-            )
+            || (moves_worktree
+                && crate::session::worktree_edit::ensure_sandbox_container_released(
+                    &id,
+                    live.is_sandboxed(),
+                ))
         {
             bail!("Stop the session before renaming it: its worktree directory moves to match the new name. Disable session.tie_workdir_to_name to relabel a running session.");
         }
-        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
         match crate::session::worktree_edit::edit_worktree_workdir(
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info: &worktree_info,
@@ -1776,10 +1784,21 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     crate::tmux::refresh_session_cache();
     live.update_status();
     // A sandbox container keeps the worktree dir mounted even while the agent
-    // is Idle, so the move would fail with EBUSY; stopping the session releases
-    // the mount, same as the active-status case.
+    // is Idle, so the move would fail. The gate drops a merely-stopped
+    // container to free the mount and only reports held for a live one, which
+    // the user has to stop, same as the active-status case. Gated on the
+    // directory actually moving so a no-op or branch-only edit does not discard
+    // a container for a move that never happens.
+    let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+        std::path::Path::new(&current_path),
+        args.name.trim(),
+    );
     if live.status.blocks_worktree_edit()
-        || crate::session::worktree_edit::sandbox_container_holds_worktree(&id, live.is_sandboxed())
+        || (moves_worktree
+            && crate::session::worktree_edit::ensure_sandbox_container_released(
+                &id,
+                live.is_sandboxed(),
+            ))
     {
         bail!("Cannot edit the workdir name while the session is active; stop it first");
     }
