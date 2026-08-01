@@ -1075,6 +1075,80 @@ impl HomeView {
         Ok(())
     }
 
+    /// Attach a repo to `id` and, when a worker is live, restart it so the agent
+    /// can see the new root (#3103).
+    ///
+    /// The worktree is created before anything is persisted, so a save failure
+    /// rolls it back rather than leaving an orphan on disk. The restart goes
+    /// through the same restart marker `aoe acp restart` writes, so the daemon
+    /// respawns with the stored ACP session id and the transcript survives.
+    /// Dispatch an attach onto the background poller.
+    ///
+    /// Returns as soon as the request is queued; the outcome arrives through
+    /// [`super::HomeView::apply_attach_project_results`]. An `Err` here is a
+    /// refusal the caller can show immediately, so every check that can be made
+    /// from the in-memory instance is made here rather than on the worker.
+    pub(super) fn add_project_to_session(
+        &mut self,
+        id: &str,
+        repo_path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let Some(instance) = self.get_instance(id).cloned() else {
+            anyhow::bail!("Session no longer exists");
+        };
+        // Defence in depth behind the picker's own gate: this is the choke point
+        // both TUI entry points share, and it is what SIGTERMs the worker below.
+        // See `open_add_project_for_selected` for why the check is the observed
+        // status rather than the daemon's event-log probe.
+        if matches!(
+            instance.status,
+            crate::session::Status::Creating | crate::session::Status::Deleting
+        ) {
+            anyhow::bail!(
+                "Wait for the session to finish starting or deleting before attaching a project"
+            );
+        }
+        // The same set the picker refuses, via the shared helper: `Waiting` and
+        // `Starting` are turns in flight just as much as `Running`, and killing
+        // the worker in `Waiting` discards a pending approval.
+        if instance.status.blocks_worktree_edit() {
+            anyhow::bail!(
+                "The agent is mid-turn and attaching restarts it; wait for the turn to finish or stop the session first"
+            );
+        }
+        // Trashed and archived too, so the set matches the picker's gate: a
+        // status flip while the picker is open must not slip an attach onto a
+        // session whose agent is deliberately stopped.
+        if instance.is_trashed() {
+            anyhow::bail!("This session is in the trash; restore it before attaching a project");
+        }
+        if instance.is_archived() {
+            anyhow::bail!(
+                "This session is archived and its agent stays stopped; unarchive it before attaching a project"
+            );
+        }
+        // One attach per session at a time: a second would race the first one's
+        // worktree creation and its worker bounce.
+        if self.attach_project_in_flight.contains(id) {
+            anyhow::bail!("An attach is already running for this session; wait for it to finish");
+        }
+
+        // Everything blocking runs on the poller thread. `git worktree add` alone
+        // takes seconds, and the fetch, submodule init, worker bounce and
+        // container removal behind it take longer; inline, that froze the UI for
+        // the whole attach. `apply_attach_project_results` reloads and reports.
+        self.attach_project_in_flight.insert(id.to_string());
+        self.attach_project_poller.request_attach(
+            crate::session::attach_project::AttachProjectRequest {
+                session_id: id.to_string(),
+                profile: instance.source_profile.clone(),
+                repo_path: repo_path.to_path_buf(),
+                is_sandboxed: instance.is_sandboxed(),
+            },
+        );
+        Ok(())
+    }
+
     pub(super) fn rename_selected(
         &mut self,
         new_title: &str,

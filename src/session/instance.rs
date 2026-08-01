@@ -347,7 +347,7 @@ pub struct WorktreeInfo {
     pub base_branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceRepo {
     pub name: String,
     pub source_path: String,
@@ -355,6 +355,16 @@ pub struct WorkspaceRepo {
     pub worktree_path: String,
     pub main_repo_path: String,
     pub managed_by_aoe: bool,
+    /// True when `branch` already existed in this repo and aoe merely checked it
+    /// out, which makes branch deletion on session delete a no-op.
+    ///
+    /// Only ever set by `attach_project` with `--attach-existing-branch` (#3103):
+    /// the workspace builder always creates the branch it names, so branch and
+    /// worktree ownership coincide for a repo present at creation. Phrased as
+    /// "pre-existing" rather than "aoe created it" so the serde default is
+    /// correct for every record written before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub branch_preexisting: bool,
 }
 
 fn default_true() -> bool {
@@ -1464,6 +1474,20 @@ impl Instance {
                 .is_some_and(|ws| ws.cleanup_on_delete)
     }
 
+    /// Every repo this session works in, empty for a single-repo session.
+    ///
+    /// The one accessor consumers read, so nothing has to know that a session
+    /// gains repos two ways: created multi-repo, or converted by
+    /// `attach_project` (#3103). Both end up in `workspace_info.repos`, which is
+    /// the point of converting rather than keeping a second list: a repo added
+    /// later is indistinguishable from one present at creation.
+    pub fn all_repos(&self) -> &[WorkspaceRepo] {
+        self.workspace_info
+            .as_ref()
+            .map(|ws| ws.repos.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Stamp `last_accessed_at` to the current time AND wake the session
     /// from any sink state. Call this on user-initiated interactions
     /// (attach, send keys, etc.); every existing call site already does.
@@ -1777,6 +1801,12 @@ impl Instance {
         if pre.worktree_info != post.worktree_info {
             self.worktree_info = post.worktree_info.clone();
         }
+        // `workspace_info` deliberately has NO arm. Attaching a project (#3103)
+        // converts the session into a workspace, but it does that through
+        // `Storage::update` (which takes both lock layers) rather than through a
+        // user-action diff, so the value on disk is already authoritative here.
+        // Assigning `post`'s copy would let a stale TUI snapshot clobber a
+        // conversion a peer landed between the `pre` snapshot and this merge.
         if pre.status != post.status {
             self.status = post.status;
         }
@@ -8377,6 +8407,7 @@ mod tests {
                 worktree_path: "/tmp/ws/repo-a".to_string(),
                 main_repo_path: "/tmp/src/repo-a".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             }],
             created_at: Utc::now(),
             cleanup_on_delete: true,

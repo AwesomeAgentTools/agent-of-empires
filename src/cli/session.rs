@@ -38,6 +38,12 @@ pub enum SessionCommands {
     /// Auto-detect current session
     Current(CurrentArgs),
 
+    /// Attach another repo to an existing session, so an agent that turns out
+    /// to need a second repo can keep working in the same conversation instead
+    /// of the session being recreated. Creates a worktree for the repo and
+    /// restarts the agent so it can see it; the conversation is kept. See #3103.
+    AddProject(AddProjectArgs),
+
     /// Set the resume target for a session (pin a conversation or force a
     /// one-shot fresh start)
     SetSessionId(SetSessionIdArgs),
@@ -276,6 +282,22 @@ pub struct SetSessionIdArgs {
 }
 
 #[derive(Args)]
+pub struct AddProjectArgs {
+    /// Session ID or title
+    pub identifier: String,
+    /// Repo to attach: a path, or the name of a registered project
+    /// (`aoe project list`).
+    pub project: String,
+    /// Check out a branch that already exists in the repo being attached
+    /// instead of refusing. A same-named branch in another repo can hold
+    /// unrelated commits, so this is off by default. When set, aoe records the
+    /// branch as not its own and leaves it in place when the session is
+    /// deleted.
+    #[arg(long)]
+    pub attach_existing_branch: bool,
+}
+
+#[derive(Args)]
 pub struct SetBaseArgs {
     /// Session ID or title
     pub identifier: String,
@@ -325,6 +347,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
         SessionCommands::Current(args) => current_session(args).await,
         SessionCommands::SetSessionId(args) => set_session_id(profile, args).await,
+        SessionCommands::AddProject(args) => add_project(profile, args).await,
         SessionCommands::SetBase(args) => set_base(profile, args).await,
         SessionCommands::Snooze(args) => snooze_session(profile, args).await,
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
@@ -2043,6 +2066,118 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     Ok(())
 }
 
+/// `aoe session add-project <session> <path|name>`. See #3103.
+///
+/// Attaching converts the session into a multi-repo workspace, so unless it
+/// already is one its working directory moves. That means stopping it, doing the
+/// conversion, and starting it again, which is what
+/// `attach_project::quiesce_for_conversion` / `resume_after_conversion` do for
+/// every blocking surface. A live structured worker is signalled through the
+/// same restart marker `aoe acp restart` uses, because the supervisor lives in
+/// `aoe serve`; the marker is written after the persist so the daemon cannot
+/// respawn the worker into the directory the conversion is moving.
+async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    let instances = storage.load()?;
+    let inst = super::resolve_session(&args.identifier, &instances)?;
+    let id = inst.id.clone();
+    let title = inst.title.clone();
+    let is_sandboxed = inst.is_sandboxed();
+
+    // Attaching restarts the agent, so a turn in flight would lose its reply (or,
+    // in `Waiting`, a pending approval). The daemon refuses this on the
+    // event-log probe; the CLI has no handle on that store, so it uses the status
+    // set `blocks_worktree_edit` encodes for exactly this class of operation. The
+    // unambiguous states (Creating, Deleting, trashed, archived) are refused in
+    // `attach_project::plan`, shared with every other surface.
+    if inst.status.blocks_worktree_edit() {
+        bail!(
+            "'{title}' has a turn in flight and attaching restarts the agent. Wait for it to \
+             finish, or stop the session first."
+        );
+    }
+
+    // A path-shaped argument is used as-is; a bare name is a registry lookup,
+    // matching how `aoe add --projects` resolves its extras.
+    let repo_path = if std::path::Path::new(&args.project).exists()
+        || args.project.contains(std::path::MAIN_SEPARATOR)
+    {
+        std::path::PathBuf::from(&args.project)
+    } else {
+        let resolved =
+            crate::session::projects::resolve_names(profile, std::slice::from_ref(&args.project))?;
+        match resolved.into_iter().next() {
+            Some(p) => std::path::PathBuf::from(p.path),
+            None => bail!("Project '{}' is not in the registry", args.project),
+        }
+    };
+
+    let on_existing = if args.attach_existing_branch {
+        crate::session::attach_project::ExistingBranch::Attach
+    } else {
+        crate::session::attach_project::ExistingBranch::Refuse
+    };
+
+    // Validate before stopping anything: a refusal here must not cost the user a
+    // stopped session.
+    let plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
+    let restarts = crate::session::attach_project::needs_restart(&plan, is_sandboxed);
+    let quiesced = if restarts {
+        println!("Stopping '{title}' so its working directory can move...");
+        crate::session::attach_project::quiesce_for_conversion(&storage, inst)?
+    } else {
+        crate::session::attach_project::Quiesced::default()
+    };
+
+    let outcome = match crate::session::attach_project::attach_planned(&storage, &id, inst, plan) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // The rollback already undid the filesystem half; bringing the
+            // session back is the only thing left that would otherwise persist.
+            crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced);
+            return Err(e);
+        }
+    };
+
+    println!("Attached '{}' to session '{}'", outcome.repo.name, title);
+    println!("  Worktree: {}", outcome.repo.worktree_path);
+    println!(
+        "  Branch:   {} ({})",
+        outcome.repo.branch,
+        if outcome.repo.branch_preexisting {
+            "existing, aoe will not delete it"
+        } else {
+            "created"
+        }
+    );
+    if let Some(moved_to) = &outcome.moved_to {
+        println!("  Workspace: {moved_to}");
+        println!(
+            "  This session is now a multi-repo workspace; its working directory moved to the \
+             path above."
+        );
+    }
+    for warning in &outcome.warnings {
+        println!("  Warning:  {warning}");
+    }
+
+    if restarts {
+        if quiesced.worker_was_running {
+            println!("Restarting the agent so it comes up with the new repo; the conversation is preserved.");
+        } else {
+            println!("Restarting the session so it comes up with the new repo.");
+        }
+    } else {
+        println!("The agent is already working in this directory, so nothing was restarted.");
+    }
+    for warning in crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced)
+    {
+        println!("  Warning:  {warning}");
+    }
+
+    Ok(())
+}
+
 async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     if !args.clear && args.branch.is_none() {
         bail!("Provide a branch ref or pass --clear to remove the override.");
@@ -2117,6 +2252,36 @@ mod restart_args_tests {
                 assert_eq!(args.parallel, 3);
             }
             _ => panic!("wrong subcommand"),
+        }
+    }
+
+    /// Refusing an existing branch is the default, because a same-named branch
+    /// in another repo can hold unrelated commits.
+    #[test]
+    fn add_project_parses_its_identifier_project_and_branch_opt_in() {
+        let cases = [
+            (vec!["aoe", "add-project", "claude-3", "../frontend"], false),
+            (
+                vec![
+                    "aoe",
+                    "add-project",
+                    "claude-3",
+                    "../frontend",
+                    "--attach-existing-branch",
+                ],
+                true,
+            ),
+        ];
+        for (argv, attach_existing) in cases {
+            let cli = Cli::try_parse_from(&argv).expect("add-project must parse");
+            match cli.cmd {
+                SessionCommands::AddProject(args) => {
+                    assert_eq!(args.identifier, "claude-3");
+                    assert_eq!(args.project, "../frontend");
+                    assert_eq!(args.attach_existing_branch, attach_existing, "{argv:?}");
+                }
+                _ => panic!("wrong subcommand"),
+            }
         }
     }
 
