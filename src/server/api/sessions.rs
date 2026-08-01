@@ -2861,9 +2861,9 @@ pub async fn force_smart_rename(
 
     // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
     // action never reports success (202) for a session the gate would silently
-    // drop (sandboxed, or a resolved rename agent with no one-shot / an
-    // overridden command). Without this, the sidebar would show success while
-    // no title job runs. Resolves with the SAME repo-aware config the worker
+    // drop (a resolved rename agent with no one-shot, an overridden command, or
+    // a sandboxed session whose rename agent is not its own). Without this, the
+    // sidebar would show success while no title job runs. Resolves with the SAME repo-aware config the worker
     // uses (resolve_config_with_repo_or_warn), so a repo-local smart_rename_agent
     // or agent_command_override cannot make the preflight and worker disagree.
     // Passes `setting_on = true` because this is the manual "Auto-name now"
@@ -2885,29 +2885,61 @@ pub async fn force_smart_rename(
         &config.agent_command_override,
     ) {
         use crate::session::smart_rename::SkipReason;
-        let (status, message) = match reason {
-            SkipReason::NotStructured => (
-                StatusCode::BAD_REQUEST,
-                "Session is not a structured-view session",
-            ),
-            SkipReason::NameNotDefault => {
-                (StatusCode::CONFLICT, "Session already has a custom name")
-            }
-            SkipReason::Disabled => (StatusCode::CONFLICT, "Smart rename is disabled in settings"),
-            SkipReason::Sandboxed => (
-                StatusCode::CONFLICT,
-                "Smart rename is not available for sandboxed sessions",
-            ),
-            SkipReason::NoOneshot => (
-                StatusCode::CONFLICT,
-                "The smart-rename agent has no one-shot mode",
-            ),
-            SkipReason::CommandOverridden => (
-                StatusCode::CONFLICT,
-                "The smart-rename agent's command is overridden",
-            ),
+        // Wording comes from the shared `user_message` so this response and the
+        // TUI's dialog cannot drift; only the status code is per-reason.
+        let status = match reason {
+            SkipReason::NotStructured => StatusCode::BAD_REQUEST,
+            _ => StatusCode::CONFLICT,
         };
-        return (status, Json(serde_json::json!({ "message": message }))).into_response();
+        return (
+            status,
+            Json(serde_json::json!({ "message": reason.user_message() })),
+        )
+            .into_response();
+    }
+
+    // A sandboxed session's one-shot runs inside its container, so a stopped
+    // container is the one remaining way the spawned job would drop the session
+    // after the static gate passed. Probe it here too, else this would answer 202
+    // while nothing renames, which is exactly what the gate above exists to
+    // prevent. Same check and wording as the TUI's preflight; the spawned
+    // try_smart_rename re-probes and stays the authority.
+    if sandboxed {
+        use crate::containers::Probe;
+        let sid = id.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            crate::containers::DockerContainer::from_session_id(&sid).probe_running()
+        })
+        .await;
+        // A failed inspection is not a stopped container: telling the user to
+        // start a container that may already be running sends them the wrong
+        // way, so the runtime error is surfaced as its own state. Same split as
+        // the TUI preflight.
+        let unknown = match probe {
+            Ok(Probe::Running) => None,
+            Ok(Probe::NotRunning) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "container_not_running",
+                        "message": "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.",
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(Probe::Unknown(e)) => Some(e.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(err) = unknown {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "container_state_unknown",
+                    "message": format!("Couldn't check the session's sandbox container, so its agent cannot be asked for a name: {err}"),
+                })),
+            )
+                .into_response();
+        }
     }
 
     let Some((first_user_prompt, agent_prose)) = state
@@ -3015,7 +3047,9 @@ pub async fn summarize_session(
                 "The summary agent's command is overridden",
             ),
             // resolve_summary_agent never returns the rename-only reasons.
-            SkipReason::NameNotDefault | SkipReason::Disabled => (
+            SkipReason::NameNotDefault
+            | SkipReason::Disabled
+            | SkipReason::SandboxRenameAgentMismatch => (
                 StatusCode::CONFLICT,
                 "Conversation summary is unavailable for this session",
             ),
