@@ -2135,7 +2135,7 @@ impl HomeView {
             group_by,
             row_tag_mode: resolved.session.row_tag,
             agent_clipboard_forward: resolved.tmux.clipboard
-                != crate::session::config::TmuxClipboardMode::Disabled,
+                != crate::session::config::TmuxSettingMode::Disabled,
             vt_live_enabled: resolved.tmux.vt_live,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
@@ -6685,7 +6685,12 @@ impl HomeView {
             if tool.exists() {
                 let _ = tool.kill();
             }
-            tool.create_with_size(&inst.project_path, &tool_config.command, size)?;
+            tool.create_with_size(
+                &inst.project_path,
+                &tool_config.command,
+                size,
+                &inst.effective_profile(),
+            )?;
         }
         Ok(())
     }
@@ -7083,7 +7088,7 @@ impl HomeView {
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
         self.agent_clipboard_forward =
-            config.tmux.clipboard != crate::session::config::TmuxClipboardMode::Disabled;
+            config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_vt_enabled(self.vt_live_enabled);
