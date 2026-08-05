@@ -3324,6 +3324,16 @@ impl Instance {
             let launch_cmd = self.get_launch_command();
             let base_cmd = if self.extra_args.is_empty() {
                 launch_cmd
+            } else if self.command.is_empty() {
+                // Default agent binary: quote a shell-active --model/-m value
+                // the same way the host launch path does (build_host_command).
+                // A custom command override is the user's own argv, so it is
+                // left untouched, matching that path's scoping.
+                format!(
+                    "{} {}",
+                    launch_cmd,
+                    super::config::quote_model_value_in_args(&self.extra_args)
+                )
             } else {
                 format!("{} {}", launch_cmd, self.extra_args)
             };
@@ -3662,7 +3672,14 @@ impl Instance {
                 Some(a) => {
                     let mut cmd = a.launch_base_command();
                     if !self.extra_args.is_empty() {
-                        cmd = format!("{} {}", cmd, self.extra_args);
+                        // A model id carrying shell metacharacters (a
+                        // context-window suffix such as `[1m]`) would abort the
+                        // launch line before the agent starts.
+                        cmd = format!(
+                            "{} {}",
+                            cmd,
+                            super::config::quote_model_value_in_args(&self.extra_args)
+                        );
                     }
                     if self.is_yolo_mode() {
                         if let Some(ref yolo) = a.yolo {
