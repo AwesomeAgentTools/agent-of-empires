@@ -30,7 +30,8 @@ describe("Dashboard mobile recent sessions", () => {
     const onSelectSession = vi.fn();
     const sessions = [
       session("old", "2026-01-02T00:00:00Z"),
-      session("new", "2026-01-07T00:00:00Z"),
+      session("whole-second", "2026-01-07T00:00:00+00:00"),
+      session("new", "2026-01-07T00:00:00.500+00:00"),
       session("middle", "2026-01-04T00:00:00Z"),
       session("four", "2026-01-05T00:00:00Z"),
       session("five", "2026-01-06T00:00:00Z"),
@@ -52,10 +53,10 @@ describe("Dashboard mobile recent sessions", () => {
     expect(recent.className).toContain("md:hidden");
     expect(withinText(recent)).toEqual([
       "Session new",
+      "Session whole-second",
       "Session five",
       "Session four",
       "Session middle",
-      "Session six",
     ]);
     expect(screen.queryByText("Session old")).toBeNull();
     expect(screen.queryByText("Session trash")).toBeNull();

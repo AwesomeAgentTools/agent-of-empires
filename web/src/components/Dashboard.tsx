@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import type { SessionResponse } from "../lib/types";
 import { getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { useIsWideViewport } from "../hooks/useIsWideViewport";
 import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandMark";
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
 import { PluginCards } from "./plugin/PluginSlots";
@@ -29,6 +30,7 @@ export function Dashboard({
   canManageProjects = true,
 }: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
+  const isWideViewport = useIsWideViewport();
   const stats = useMemo(() => {
     const projects = new Set<string>();
     let total = 0;
@@ -53,7 +55,7 @@ export function Dashboard({
     () =>
       sessions
         .filter((session) => !session.trashed_at)
-        .sort((a, b) => recentSessionTimestamp(b).localeCompare(recentSessionTimestamp(a)) || b.id.localeCompare(a.id))
+        .sort((a, b) => recentSessionTimestamp(b) - recentSessionTimestamp(a) || b.id.localeCompare(a.id))
         .slice(0, 5),
     [sessions],
   );
@@ -136,7 +138,7 @@ export function Dashboard({
       {/* The desktop sidebar is always available, but mobile starts at this
           dashboard. Keep a small, direct route back into the sessions the user
           was just working with instead of making them open the full picker. */}
-      {recentSessions.length > 0 && (
+      {!isWideViewport && recentSessions.length > 0 && (
         <section className="md:hidden mb-4 w-full max-w-md" aria-labelledby="recent-sessions-heading">
           <h2
             id="recent-sessions-heading"
@@ -150,7 +152,7 @@ export function Dashboard({
                 key={session.id}
                 type="button"
                 onClick={() => onSelectSession(session.id)}
-                className="flex w-full items-center gap-3 border-b border-surface-700/40 px-3 py-2.5 text-left last:border-b-0 hover:bg-surface-850 active:bg-surface-800 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-brand-600"
+                className="flex w-full cursor-pointer items-center gap-3 border-b border-surface-700/40 px-3 py-2.5 text-left last:border-b-0 hover:bg-surface-850 active:bg-surface-800 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-brand-600"
               >
                 <span
                   aria-hidden="true"
@@ -250,8 +252,9 @@ export function Dashboard({
   );
 }
 
-function recentSessionTimestamp(session: SessionResponse): string {
-  return session.last_accessed_at ?? session.created_at ?? "";
+function recentSessionTimestamp(session: SessionResponse): number {
+  const timestamp = Date.parse(session.last_accessed_at ?? session.created_at);
+  return Number.isNaN(timestamp) ? 0 : timestamp;
 }
 
 function ActionPane({

@@ -261,11 +261,13 @@ test.describe("Mobile responsive", () => {
       expect.stringContaining("Session six"),
     ]);
 
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await expect(recent).not.toBeAttached();
+
+    await page.setViewportSize({ width: 375, height: 812 });
+    await expect(recent).toBeVisible();
     await recent.getByRole("button", { name: /Session new/ }).click();
     await expect(page).toHaveURL(/\/session\/new$/);
-
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await expect(recent).toBeHidden();
   });
 
   test("hamburger opens sidebar overlay on mobile", async ({ page }) => {
