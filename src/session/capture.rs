@@ -827,26 +827,30 @@ pub(crate) fn compose_exclusion(
 }
 
 /// Extend [`compose_exclusion`] with conversations same-project peers parked
-/// for `current_tool` during an engine swap. For Claude, also include the sids
-/// of stopped, archived, or pane-less peers. Persisted peers are read from
-/// `sessions.json` via `Storage` for the caller's effective profile.
+/// for `current_tool` during an engine swap. When
+/// `include_inactive_same_tool` is true, also include the sids of stopped,
+/// archived, or pane-less peers using `current_tool`. Persisted peers are read
+/// from `sessions.json` via `Storage` for the caller's effective profile.
 ///
 /// Used by `Instance::try_retroactive_capture` and snapshotted when its poller
 /// starts. Parked conversations are no longer published in the peer's tmux
 /// environment, so [`build_exclusion_set`] cannot see them. Without this set,
 /// another session can capture the parked conversation before its owner swaps
-/// back. Claude additionally needs stopped peer protection because its mtime
-/// fallback can select a jsonl after the owning tmux pane disappears (#2355).
+/// back. Claude and host Codex additionally need stopped peer protection
+/// because their mtime fallbacks can select a transcript after the owning tmux
+/// pane disappears (#2355). Sandboxed Codex sessions have instance-private
+/// `CODEX_HOME` directories and do not share a transcript store (#3317).
 ///
-/// Scope: `~/.claude/projects/` is keyed by `$HOME`, not by AoE profile,
-/// but this helper only inspects `sessions.json` for the caller's effective
-/// profile. A stopped peer in a different profile against the same host
-/// `$HOME` will not be excluded; the residual gap is narrower than #2355's
+/// Scope: the host transcript directories are keyed by `$HOME`, not by AoE
+/// profile, but this helper only inspects `sessions.json` for the caller's
+/// effective profile. A stopped peer in a different profile against the same
+/// host `$HOME` will not be excluded; the residual gap is narrower than #2355's
 /// trigger and is left for a follow-up.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
     current_tool: &str,
+    include_inactive_same_tool: bool,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
@@ -882,7 +886,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         {
             set.insert(parked.to_string());
         }
-        if current_tool != "claude" || inst.tool != "claude" {
+        if !include_inactive_same_tool || inst.tool != current_tool {
             continue;
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
