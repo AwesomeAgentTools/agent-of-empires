@@ -36,13 +36,20 @@ pub struct SystemSample {
     pub swap_used_bytes: u64,
 }
 
+/// One agent's resource usage. Every figure is optional because a sandboxed
+/// agent's numbers come from the container runtime, which may not have a
+/// sample yet (or at all, on a runtime without a stats command); reporting
+/// unknown is the honest reading, a zero would not be.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AgentMetric {
     pub id: String,
     pub title: String,
     pub cpu_fraction: Option<f64>,
-    pub rss_bytes: u64,
-    pub procs: usize,
+    pub rss_bytes: Option<u64>,
+    pub procs: Option<usize>,
+    /// Measured inside a sandbox container rather than on the host process
+    /// tree. The memory figure is then the container's usage, not an RSS sum.
+    pub sandboxed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -104,7 +111,7 @@ impl MetricsSampler {
         let agents = aggregate_agents(instances, &processes, elapsed, &self.last_process_cpu);
         let counts = AgentCounts {
             agents: agents.len(),
-            procs: agents.iter().map(|a| a.procs).sum(),
+            procs: agents.iter().filter_map(|a| a.procs).sum(),
         };
 
         self.last_at = Some(now);
@@ -139,6 +146,62 @@ fn eligible_instance(inst: &Instance) -> bool {
         )
 }
 
+/// One row's figures: `(cpu_fraction, memory_bytes, procs)`.
+type RowFigures = (Option<f64>, Option<u64>, Option<usize>);
+
+/// The sandbox container backing `inst`, if it has one. Both agent populations
+/// route through this, so a tmux pane and a structured worker cannot disagree
+/// about whether a session is sandboxed.
+fn sandbox_container_name(inst: &Instance) -> Option<&str> {
+    inst.sandbox_info
+        .as_ref()
+        .filter(|s| s.enabled)
+        .map(|s| s.container_name.as_str())
+}
+
+/// Figures as the container runtime reports them, or all-unknown when it has
+/// no sample for this container: a cold cache, a stopped container, or a
+/// runtime with no stats command. Unknown renders "?"; a zero would read as a
+/// measured idle.
+fn container_figures(stats: &crate::containers::stats::StatsMap, name: &str) -> RowFigures {
+    match stats.get(name) {
+        Some(stats) => (
+            // `cpu_percent` is per-core (100 == one core saturated); the table
+            // reads as a share of the whole host, like the host rows.
+            Some(stats.cpu_percent / 100.0 / logical_cpus() as f64),
+            Some(stats.mem_used_bytes),
+            Some(stats.pids),
+        ),
+        None => (None, None, None),
+    }
+}
+
+/// Figures summed over a host process tree.
+fn host_figures(
+    pids: &[u32],
+    by_pid: &HashMap<u32, &ProcessRecord>,
+    elapsed: Option<f64>,
+    previous: &HashMap<(u32, u64), f64>,
+) -> RowFigures {
+    let rss_bytes = pids
+        .iter()
+        .filter_map(|pid| by_pid.get(pid))
+        .map(|p| p.rss_bytes)
+        .sum();
+    let cpu_fraction = elapsed.filter(|v| *v > 0.0).map(|seconds| {
+        pids.iter()
+            .filter_map(|pid| by_pid.get(pid))
+            .filter_map(|p| {
+                let old = previous.get(&(p.pid, p.start_id))?;
+                Some((p.cpu_seconds - old).max(0.0))
+            })
+            .sum::<f64>()
+            / seconds
+            / logical_cpus() as f64
+    });
+    (cpu_fraction, Some(rss_bytes), Some(pids.len()))
+}
+
 fn aggregate_agents(
     instances: &[Instance],
     processes: &[ProcessRecord],
@@ -161,6 +224,35 @@ fn aggregate_agents(
         .filter(|i| eligible_instance(i))
         .cloned()
         .collect();
+    #[cfg(feature = "serve")]
+    let worker_records: Vec<crate::process::worker_registry::WorkerRecord> =
+        crate::process::worker_registry::list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(crate::process::worker_registry::is_record_live)
+            .collect();
+
+    // Structured sessions are excluded from `eligible`, so their sandboxes
+    // have to be counted here or a host whose only sandbox runs under a
+    // structured worker would never fetch the map its row needs.
+    #[cfg(feature = "serve")]
+    let sandboxed_worker = worker_records.iter().any(|rec| {
+        instances
+            .iter()
+            .any(|i| i.id == rec.session_id && sandbox_container_name(i).is_some())
+    });
+    #[cfg(not(feature = "serve"))]
+    let sandboxed_worker = false;
+
+    // Skip the runtime's stats pass unless a sandbox session is loaded;
+    // `cached_stats` then hands back the last completed map without blocking.
+    // Not gated on the health surface being open: the sampler also runs for
+    // the compact strip and for the undiscovered-tip check, so a host with a
+    // sandbox pays one refresh per TTL whenever the TUI is sampling at all.
+    let container_stats = (eligible.iter().any(|i| sandbox_container_name(i).is_some())
+        || sandboxed_worker)
+        .then(crate::containers::stats::cached_stats)
+        .unwrap_or_default();
     let alive = crate::session::recovery::orphaned_agents_alive(&eligible);
     for (inst, is_alive) in eligible.iter().zip(alive) {
         if !is_alive {
@@ -184,37 +276,28 @@ fn aggregate_agents(
                 stack.extend(children);
             }
         }
-        let rss_bytes = pids
-            .iter()
-            .filter_map(|pid| by_pid.get(pid))
-            .map(|p| p.rss_bytes)
-            .sum();
-        let cpu_fraction = elapsed.filter(|v| *v > 0.0).map(|seconds| {
-            pids.iter()
-                .filter_map(|pid| by_pid.get(pid))
-                .filter_map(|p| {
-                    let old = previous.get(&(p.pid, p.start_id))?;
-                    Some((p.cpu_seconds - old).max(0.0))
-                })
-                .sum::<f64>()
-                / seconds
-                / logical_cpus() as f64
-        });
+        // The pid tree is still walked for a sandboxed session, so its pane
+        // processes are claimed and cannot be double-counted onto a neighbour,
+        // but its figures come from the container instead: the pane holds a
+        // `docker exec` client, while the agent runs in the container, off
+        // this process tree entirely.
+        let sandbox_container = sandbox_container_name(inst);
+        let (cpu_fraction, rss_bytes, procs) = match sandbox_container {
+            Some(name) => container_figures(&container_stats, name),
+            None => host_figures(&pids, &by_pid, elapsed, previous),
+        };
         rows.push(AgentMetric {
             id: inst.id.clone(),
             title: inst.title.clone(),
             cpu_fraction,
             rss_bytes,
-            procs: pids.len(),
+            procs,
+            sandboxed: sandbox_container.is_some(),
         });
     }
 
     #[cfg(feature = "serve")]
-    for rec in crate::process::worker_registry::list()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(crate::process::worker_registry::is_record_live)
-    {
+    for rec in worker_records {
         let Some(root) = by_pid.get(&rec.pid) else {
             continue;
         };
@@ -232,25 +315,16 @@ fn aggregate_agents(
                 stack.extend(children);
             }
         }
-        let rss_bytes = pids
-            .iter()
-            .filter_map(|pid| by_pid.get(pid))
-            .map(|p| p.rss_bytes)
-            .sum();
-        let cpu_fraction = elapsed.filter(|v| *v > 0.0).map(|seconds| {
-            pids.iter()
-                .filter_map(|pid| by_pid.get(pid))
-                .filter_map(|p| {
-                    let old = previous.get(&(p.pid, p.start_id))?;
-                    Some((p.cpu_seconds - old).max(0.0))
-                })
-                .sum::<f64>()
-                / seconds
-                / logical_cpus() as f64
-        });
-        let title = instances
-            .iter()
-            .find(|i| i.id == rec.session_id)
+        // A sandboxed structured session wraps its agent in `docker exec` just
+        // as a tmux pane does (see `spawn_runner_detached`), so the host tree
+        // here is the runner shim plus that client, not the agent.
+        let inst = instances.iter().find(|i| i.id == rec.session_id);
+        let sandbox_container = inst.and_then(sandbox_container_name);
+        let (cpu_fraction, rss_bytes, procs) = match sandbox_container {
+            Some(name) => container_figures(&container_stats, name),
+            None => host_figures(&pids, &by_pid, elapsed, previous),
+        };
+        let title = inst
             .map(|i| i.title.clone())
             .unwrap_or_else(|| rec.agent_name.clone());
         rows.push(AgentMetric {
@@ -258,7 +332,8 @@ fn aggregate_agents(
             title,
             cpu_fraction,
             rss_bytes,
-            procs: pids.len(),
+            procs,
+            sandboxed: sandbox_container.is_some(),
         });
     }
 

@@ -408,6 +408,51 @@ impl ContainerRuntime {
             }
         }
     }
+
+    /// Resource usage of every running container named with `prefix`, in a
+    /// single subprocess call.
+    ///
+    /// `--no-stream` still costs seconds, because the runtime samples every
+    /// running container twice to produce a CPU delta; callers go through
+    /// [`super::stats::cached_stats`] rather than calling this on a UI cadence.
+    pub fn batch_stats(&self, prefix: &str) -> super::stats::StatsMap {
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                // Stats everything and prefix-filters the rows, unlike
+                // `batch_running_states`, which narrows with `--filter name=`.
+                // The asymmetry is deliberate: `stats` has no `--filter`, and
+                // naming containers positionally fails the whole call with
+                // "No such container" if any one of them is gone, which is a
+                // normal state for a session whose sandbox has stopped.
+                let output = self
+                    .base
+                    .command()
+                    .args([
+                        "stats",
+                        "--no-stream",
+                        "--format",
+                        // A literal tab, not the `\t` escape: the argv reaches
+                        // the runtime without a shell, and Go template text is
+                        // emitted verbatim either way.
+                        "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}",
+                    ])
+                    .output();
+
+                let output = match output {
+                    Ok(o) if o.status.success() => o,
+                    _ => return super::stats::StatsMap::new(),
+                };
+
+                super::stats::parse_stats_output(&String::from_utf8_lossy(&output.stdout), prefix)
+            }
+            // Apple's `container` CLI has no stats subcommand, so a sandbox on
+            // that runtime reports unknown rather than a fabricated number.
+            RuntimeKind::AppleContainer => {
+                let _ = prefix;
+                super::stats::StatsMap::new()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
