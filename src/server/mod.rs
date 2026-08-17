@@ -247,6 +247,12 @@ pub struct CleanupDefaultsCache {
 
 pub const CLEANUP_DEFAULTS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long attachment bytes buffered for a queued prompt live before the
+/// hourly sweep reclaims them (Q5 in the server-side prompt queue design). A
+/// queued prompt normally drains within seconds; this only catches bytes
+/// stranded by a session that never becomes idle again.
+const PENDING_ATTACHMENT_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 impl CleanupDefaultsCache {
     pub fn stale(&self) -> bool {
         self.refreshed_at.elapsed() >= CLEANUP_DEFAULTS_TTL
@@ -1328,6 +1334,19 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                     tokio::select! {
                         _ = interval.tick() => {
                             crate::server::api::purge_expired_trash(&sweep_state).await;
+                            // Q5: reclaim attachment bytes buffered for a queued
+                            // prompt that never drained (a session that never went
+                            // idle again). Removal/clear/drain/session-delete drop
+                            // these already, so this only catches the stranded tail.
+                            let store = sweep_state.acp_event_store.clone();
+                            let pruned = tokio::task::spawn_blocking(move || {
+                                store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
+                            })
+                            .await
+                            .unwrap_or(0);
+                            if pruned > 0 {
+                                tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
+                            }
                         }
                         _ = shutdown.cancelled() => break,
                     }
@@ -1994,6 +2013,16 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/acp/enable", post(api::acp_enable))
         .route("/api/sessions/{id}/acp/disable", post(api::acp_disable))
         .route(
+            "/api/sessions/{id}/queue",
+            post(api::queue_enqueue)
+                .get(api::queue_list)
+                .delete(api::queue_clear),
+        )
+        .route(
+            "/api/sessions/{id}/queue/{promptId}",
+            patch(api::queue_edit).delete(api::queue_remove),
+        )
+        .route(
             "/api/sessions/{id}/acp/approvals/{nonce}",
             post(api::resolve_approval),
         )
@@ -2501,6 +2530,12 @@ const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/force_end_turn"),
     ("POST", "/api/sessions/{id}/acp/approvals/{nonce}"),
     ("POST", "/api/sessions/{id}/acp/elicitations/{nonce}"),
+    // Server-owned prompt queue: deferred prompting into a session the caller
+    // already sees, so it is classified exactly like `acp/prompt` above.
+    ("POST", "/api/sessions/{id}/queue"),
+    ("DELETE", "/api/sessions/{id}/queue"),
+    ("PATCH", "/api/sessions/{id}/queue/{promptId}"),
+    ("DELETE", "/api/sessions/{id}/queue/{promptId}"),
     // Curated settings surfaces (the handlers field-filter / strip color-mode).
     ("PATCH", "/api/profiles/{name}/settings"),
     ("PATCH", "/api/theme"),
@@ -2964,23 +2999,42 @@ fn is_valid_token_format(token: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() || c.is_ascii_lowercase())
 }
 
-/// Load an existing auth token from disk if it's less than 24 hours old,
-/// otherwise generate a fresh one and persist it.
+/// Load an existing auth token from disk if it was last used less than 24
+/// hours ago, otherwise generate a fresh one and persist it.
+///
+/// "Last used" is the file's mtime, which we refresh on every reuse. The age
+/// window is therefore idle-based: a server that is restarted at least once a
+/// day keeps the same token indefinitely, and only a token untouched for 24h
+/// rotates. This is deliberate. A token change forces the rotation-prune path
+/// (`retain_owners`) to drop push subscriptions bound to the now-stale hash,
+/// so if the window were measured from creation, every restart after the first
+/// day would rotate the token and silently kill push notifications until each
+/// device re-subscribed (#3386). Rotation while the server runs continuously
+/// is still driven by the scheduled rotation loop, not by this function.
 async fn load_or_generate_token() -> anyhow::Result<String> {
     let app_dir = crate::session::get_app_dir()?;
-    let token_path = app_dir.join("serve.token");
+    let max_age = std::time::Duration::from_secs(24 * 60 * 60);
+    Ok(load_or_generate_token_at(&app_dir.join("serve.token"), max_age).await)
+}
 
-    // Try to reuse existing token if fresh enough
+async fn load_or_generate_token_at(
+    token_path: &std::path::Path,
+    max_age: std::time::Duration,
+) -> String {
+    // Try to reuse existing token if it was used recently enough.
     if let Ok(metadata) = tokio::fs::metadata(&token_path).await {
         if let Ok(modified) = metadata.modified() {
             let age = std::time::SystemTime::now()
                 .duration_since(modified)
                 .unwrap_or_default();
-            if age < std::time::Duration::from_secs(24 * 60 * 60) {
+            if age < max_age {
                 if let Ok(token) = tokio::fs::read_to_string(&token_path).await {
                     let token = token.trim().to_string();
                     if !token.is_empty() && is_valid_token_format(&token) {
-                        return Ok(token);
+                        // Refresh the mtime so this reuse resets the idle
+                        // window; the token stays stable across restarts.
+                        write_secret_file(token_path, &token).await;
+                        return token;
                     }
                 }
             }
@@ -2988,8 +3042,8 @@ async fn load_or_generate_token() -> anyhow::Result<String> {
     }
 
     let token = generate_token();
-    write_secret_file(&token_path, &token).await;
-    Ok(token)
+    write_secret_file(token_path, &token).await;
+    token
 }
 
 /// Load sessions from all profiles, matching the TUI's "all profiles" view.
@@ -9628,6 +9682,52 @@ mod tests {
         mgr.rotate().await;
         let after = mgr.current_token().await;
         assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn load_or_generate_token_is_stable_across_restarts_but_rotates_when_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+
+        // First start generates and persists a token.
+        let first = load_or_generate_token_at(&path, day).await;
+        assert!(is_valid_token_format(&first));
+
+        // A restart within the window reuses the token AND refreshes its mtime,
+        // so the idle clock is measured from last use, not creation. Backdate
+        // the file to simulate a day-old server; the restart must reuse the
+        // token and reset its age near zero. Before #3386 the mtime was set
+        // only at creation, so a day-old token rotated on the very next restart
+        // and silently killed push. (Use a generous window here so the reuse
+        // path runs regardless of how precisely the sandbox fs honors the
+        // backdate; the rotation case below is asserted deterministically.)
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(23 * 60 * 60);
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+        let reused = load_or_generate_token_at(&path, day * 100).await;
+        assert_eq!(
+            reused, first,
+            "a restart within the window must reuse the token"
+        );
+        let age = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(
+            age < std::time::Duration::from_secs(60),
+            "reuse must refresh the mtime, got age {age:?}"
+        );
+
+        // A token older than the window rotates. Drive this with a zero-length
+        // window so any existing file counts as stale, independent of the
+        // filesystem's mtime precision: the next start must generate a fresh one.
+        let rotated = load_or_generate_token_at(&path, std::time::Duration::ZERO).await;
+        assert_ne!(rotated, first, "a token idle past the window rotates");
     }
 
     #[tokio::test]
