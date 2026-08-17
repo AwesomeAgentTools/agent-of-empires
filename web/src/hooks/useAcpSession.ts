@@ -11,13 +11,18 @@ import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalSt
 import {
   appendElicitationAnswerRow,
   applyEvent,
+  applyReducedState,
   emptyAcpState,
   isTurnActive,
   mergePrependedActivity,
+  mergeServerRows,
   normaliseTurnCounters,
+  patchServerRow,
   reduceFrames,
-  setActivityLimit,
   summarizeAnswers,
+  transcriptRowToActivity,
+  webRendersServerRow,
+  type ActivityRow,
   type ApprovalDecision,
   type AcpAttachment,
   type AcpFrame,
@@ -26,8 +31,10 @@ import {
   type ElicitationResolution,
   type PromptAttachmentInput,
   type QueuedPrompt,
+  type ReducedState,
+  type TranscriptDelta,
+  type TranscriptRow,
 } from "../lib/acpTypes";
-import { useAcpPrefs } from "../lib/acpPrefs";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { safeSetItem } from "../lib/safeStorage";
 import {
@@ -54,13 +61,43 @@ import {
 /** Outcome of an immediate prompt POST, used by the drain effect to
  *  decide whether to retire queued items (delivered or permanently
  *  rejected) or keep them for a later retry (transient failure). */
-type PromptSendResult = "ok" | "retryable_failure" | "non_retryable_failure";
+type PromptSendResult =
+  /** The daemon started a fresh turn or steered the prompt into the running
+   *  one. Either way the optimistic transcript row stands. */
+  | { kind: "dispatched" }
+  /** The daemon parked it on the server queue and returned the row id, so the
+   *  optimistic transcript row becomes a queue row. See Tier 3 in
+   *  `docs/development/server-owned-prompt-dispatch.md`. */
+  | { kind: "queued"; queuedId: string }
+  | { kind: "retryable_failure" }
+  | { kind: "non_retryable_failure" };
+
+/** Wire shape of the `/acp/prompt` 202 body (Rust `PromptDispatchResponse`). */
+interface PromptDispatchBody {
+  disposition?: "sent" | "steered" | "queued";
+  queued_id?: string;
+}
 
 export type Action =
   | { kind: "frame"; frame: AcpFrame }
-  | { kind: "frames"; frames: AcpFrame[]; oldestSeq?: number }
-  | { kind: "prepend"; frames: AcpFrame[]; oldestSeq: number }
+  /** The daemon's folded control state, adopted verbatim (Tier 1.2). */
+  | { kind: "reduced_state"; state: ReducedState; unchanged: string[] }
+  | { kind: "frames"; frames: AcpFrame[]; rows?: ActivityRow[]; oldestSeq?: number }
+  | { kind: "prepend"; rows: ActivityRow[]; oldestSeq: number }
   | { kind: "handshake"; frames: AcpFrame[] }
+  /** Full server-folded row list from a WS `transcript_snapshot` (usually a
+   *  no-op since the WS dials at the current lastSeq; carries the gap rows on
+   *  a reconnect-with-events). Merged by id. */
+  | { kind: "transcript_snapshot"; rows: ActivityRow[] }
+  /** A live `transcript_delta` Append: a new server row (merged by id, so a
+   *  re-delivered append is idempotent). */
+  | { kind: "transcript_append"; row: ActivityRow }
+  /** A live `transcript_delta` Patch: replace the row by id with the server's
+   *  authoritative new row. */
+  | { kind: "transcript_patch"; row: ActivityRow }
+  /** A live `transcript_delta` Remove: drop the row by id (an AskUserQuestion
+   *  tool card superseded by its elicitation form). */
+  | { kind: "transcript_remove"; id: string }
   | { kind: "lagged"; skipped: number }
   | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string }
   | { kind: "prompt_send_rejected" }
@@ -179,10 +216,14 @@ function evictOldestPersistedAcpState(currentKey: string): boolean {
  *  row stays in the in-memory `stateCache`, so it survives a component
  *  remount but not a hard page reload. See #1833 / #1000. */
 function toPersistedState(state: AcpState): AcpState {
-  if (!state.queuedPrompts.some((q) => q.attachments?.length)) return state;
+  // Optimistic overlay rows are ephemeral client presentation: a confirmed
+  // prompt is already in the server-owned `activity` (re-fetched on reload),
+  // so persisting the overlay would risk a stale duplicate. Drop it.
+  const base = state.optimisticRows.length > 0 ? { ...state, optimisticRows: [] } : state;
+  if (!base.queuedPrompts.some((q) => q.attachments?.length)) return base;
   return {
-    ...state,
-    queuedPrompts: state.queuedPrompts.filter((q) => !q.attachments?.length),
+    ...base,
+    queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length),
   };
 }
 
@@ -421,9 +462,13 @@ const TAIL_BEFORE = Number.MAX_SAFE_INTEGER;
  *  small because the handshake fires in the first few events. See #2236. */
 const HANDSHAKE_PREFIX_SIZE = 50;
 
-/** Shape of the `acp/replay` JSON response (forward and backward modes). */
+/** Shape of the `acp/replay` JSON response (forward and backward modes).
+ *  `rows` is present only when the request passed `?view=rows` (the
+ *  server-folded transcript rows for the page; `frames` is empty in that
+ *  case). See `ReplayResponse` in src/acp/protocol.rs. */
 type ReplayPageResponse = {
   frames: AcpFrame[];
+  rows?: TranscriptRow[] | null;
   lost: boolean;
   highest_seq: number;
   next_cursor?: number | null;
@@ -497,36 +542,75 @@ export function classifyElicitationResolveResponse(
   };
 }
 
+/** Drop optimistic overlay rows whose server counterpart has landed in
+ *  `activity` (same deterministic id), so the overlay never double-renders a
+ *  confirmed prompt / elicitation answer. Returns `state` unchanged when
+ *  nothing was pruned. */
+function pruneOptimisticRows(state: AcpState): AcpState {
+  if (state.optimisticRows.length === 0) return state;
+  const serverIds = new Set(state.activity.map((r) => r.id));
+  const kept = state.optimisticRows.filter((o) => !serverIds.has(o.id));
+  if (kept.length === state.optimisticRows.length) return state;
+  return { ...state, optimisticRows: kept };
+}
+
 export function reducer(state: AcpState, action: Action): AcpState {
   if (action.kind === "frame") {
     return applyEvent(state, action.frame);
   }
+  if (action.kind === "reduced_state") {
+    return applyReducedState(state, action.state, action.unchanged);
+  }
   if (action.kind === "frames") {
-    const next = action.frames.reduce(applyEvent, state);
-    // The recent-first tail load passes the page's lowest seq so the
-    // first forward fold seeds the older-history watermark. Live WS
-    // batches omit it (they append newer rows, never lower the floor).
+    // Reduce the raw frames for CONTROL state (turn/approvals/usage/modes),
+    // then merge the server-folded rows into the transcript (activity). The
+    // transcript is server-owned (Tier 4); `applyEvent` no longer builds it.
+    let next = action.frames.reduce(applyEvent, state);
+    if (action.rows && action.rows.length > 0) {
+      next = { ...next, activity: mergeServerRows(next.activity, action.rows) };
+      next = pruneOptimisticRows(next);
+    }
+    // The recent-first tail load passes the page's lowest seq so the first
+    // forward fold seeds the older-history watermark. Live WS batches omit it
+    // (they append newer rows, never lower the floor).
     if (action.oldestSeq != null && state.oldestSeq === 0) {
       return { ...next, oldestSeq: action.oldestSeq };
     }
     return next;
   }
   if (action.kind === "prepend") {
-    // Older history page. Reduce it in ISOLATION and prepend only its
-    // activity rows; never re-fold the whole log, because live state
-    // (optimistic prompt rows, locally-resolved approvals #1821, the
-    // prompt queue, pendingConfigOption) is not a pure fold and would be
-    // clobbered. Backward paging guarantees the page starts at a turn
-    // boundary and ends just below the current oldest, so there is no
-    // split-turn seam and no overlap to dedupe. See #2236.
+    // Older history page: prepend its server-folded rows only; never touch
+    // control state (optimistic prompt overlay, locally-resolved approvals
+    // #1821, the prompt queue, pendingConfigOption are not a pure fold and
+    // would be clobbered). Backward paging guarantees the page starts at a
+    // turn boundary and ends just below the current oldest, so the only seam
+    // artifact is a tool call whose real `tool_start` sits in this older page
+    // while a synth start was already in the tail (the server's per-page
+    // `?view=rows` fold synthesizes it); `mergePrependedActivity` merges the
+    // real start into the tail row rather than emitting a duplicate id that
+    // crashes assistant-ui's useResources ("Duplicate key"). See #2236 / #2711.
     const next = { ...state, oldestSeq: action.oldestSeq };
-    if (action.frames.length === 0) return next;
-    // A tool call split across the seam left a synthesized start in the
-    // tail; merge the older page's real start into it rather than emitting
-    // a duplicate `toolCallId` that crashes assistant-ui's useResources
-    // ("Duplicate key"). See #2711.
-    next.activity = mergePrependedActivity(reduceFrames(action.frames).activity, state.activity);
+    if (action.rows.length === 0) return next;
+    next.activity = mergePrependedActivity(action.rows, state.activity);
     return next;
+  }
+  if (action.kind === "transcript_snapshot") {
+    // WS connect snapshot: the server folds events after our `since`, so this
+    // is usually empty (the WS dials at the current lastSeq) and carries the
+    // gap rows only on a reconnect that raced live events. Merge by id.
+    if (action.rows.length === 0) return state;
+    return pruneOptimisticRows({ ...state, activity: mergeServerRows(state.activity, action.rows) });
+  }
+  if (action.kind === "transcript_append") {
+    return pruneOptimisticRows({ ...state, activity: mergeServerRows(state.activity, [action.row]) });
+  }
+  if (action.kind === "transcript_patch") {
+    return pruneOptimisticRows({ ...state, activity: patchServerRow(state.activity, action.row) });
+  }
+  if (action.kind === "transcript_remove") {
+    const activity = state.activity.filter((r) => r.id !== action.id);
+    if (activity.length === state.activity.length) return state;
+    return { ...state, activity };
   }
   if (action.kind === "handshake") {
     // Recent-first cold open skips the seq-0 handshake on a long session,
@@ -574,6 +658,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
       ...state,
       lastError: removed ? null : state.lastError,
       pendingApprovals,
+      locallyResolved: [...state.locallyResolved, action.nonce],
     };
   }
   if (action.kind === "elicitation_resolved_locally") {
@@ -583,43 +668,47 @@ export function reducer(state: AcpState, action: Action): AcpState {
     const card = state.pendingElicitations.find((e) => e.nonce === action.nonce);
     const pendingElicitations = state.pendingElicitations.filter((e) => e.nonce !== action.nonce);
     const removed = pendingElicitations.length !== state.pendingElicitations.length;
-    // Record the picked answer immediately (deduped by id), so it shows
-    // even when the broadcast is dropped by seq dedupe. See #2209.
+    // Record the picked answer as an optimistic overlay row (deduped by id),
+    // so it shows instantly; the authoritative same-id row is server-owned
+    // (the daemon folds ElicitationResolved into the transcript) and drops
+    // this overlay once it lands. See #2209.
     const answers =
       card && action.resolution.action === "accept" ? summarizeAnswers(card, action.resolution.answers) : [];
     return {
       ...state,
       lastError: removed ? null : state.lastError,
       pendingElicitations,
-      activity: appendElicitationAnswerRow(state.activity, action.nonce, answers),
+      locallyResolved: [...state.locallyResolved, action.nonce],
+      optimisticRows: appendElicitationAnswerRow(state.optimisticRows, action.nonce, answers),
     };
   }
   if (action.kind === "hydrate") {
     return action.state;
   }
   if (action.kind === "user_prompt") {
-    // Bump `pendingUserPromptSeq` rather than touching `turnActive`
-    // directly. `turnActive` derives from `pendingUserPromptSeq >
-    // lastStoppedSeq`; the derived alias is recomputed here so any
-    // existing `state.turnActive` reads stay consistent without a
-    // selector hop. Without this the late `Stopped` from the prior
-    // turn could clobber the spinner mid follow-up. See #1170.
+    // Optimistic overlay row: rendered on top of the server-owned transcript
+    // for instant feedback. Its id is the client-minted `prompt_id` sent on
+    // the POST, so the authoritative same-id `user_prompt` row the server
+    // echoes reconciles it (the overlay is dropped once that row lands in
+    // `activity`). Never appended to `activity` (that is server-owned).
+    //
+    // Bump `pendingUserPromptSeq` (the source of truth for `turnActive`,
+    // derived from `pendingUserPromptSeq > lastStoppedSeq`) so the spinner
+    // shows immediately; the server `UserPromptSent` control frame recognizes
+    // this optimistic id and does NOT double-bump. See #1170 / #3173.
     const pendingUserPromptSeq = state.pendingUserPromptSeq + 1;
+    const row: ActivityRow = {
+      id: action.id ?? `user-opt-${Date.now()}-${state.optimisticRows.length}`,
+      kind: "user_prompt",
+      text: action.text,
+      attachments: action.attachments && action.attachments.length > 0 ? action.attachments : undefined,
+      at: new Date().toISOString(),
+    };
     return {
       ...state,
-      activity: state.activity.concat({
-        // Accept a caller-supplied id so a transient send failure can
-        // roll this exact row back (see `rollback_optimistic_prompt`)
-        // rather than guessing which row to remove.
-        id: action.id ?? `user-${Date.now()}-${state.activity.length}`,
-        kind: "user_prompt",
-        text: action.text,
-        attachments: action.attachments && action.attachments.length > 0 ? action.attachments : undefined,
-        at: new Date().toISOString(),
-      }),
-      assistantMessage: "",
-      // A fresh prompt clears stale errors: the user has indicated
-      // they're trying again, so don't keep nagging them.
+      optimisticRows: state.optimisticRows.concat(row),
+      // A fresh prompt clears stale errors: the user has indicated they're
+      // trying again, so don't keep nagging them.
       startupError: null,
       lastError: null,
       pendingUserPromptSeq,
@@ -648,24 +737,21 @@ export function reducer(state: AcpState, action: Action): AcpState {
   }
   if (action.kind === "rollback_optimistic_prompt") {
     // A transient send failure (worker_not_ready 503 while resuming) re-queues
-    // the prompt, so its optimistic transcript row must be removed: otherwise
-    // the drain's re-send appends a second copy (the duplicate bubbles in the
-    // report) that the server `UserPromptSent` cannot dedupe. Remove exactly
-    // the row we appended; the prompt now lives only in `queuedPrompts` (the
-    // QUEUED strip), matching the busy-agent enqueue path where no optimistic
-    // row exists until the drain actually sends.
+    // the prompt, so its optimistic overlay row must be removed: otherwise the
+    // drain's re-send would echo a second copy the server `UserPromptSent`
+    // cannot reconcile. Remove exactly the overlay row we added; the prompt now
+    // lives only in `queuedPrompts` (the QUEUED strip).
     //
     // Deliberately DO NOT touch `pendingUserPromptSeq` / `turnActive`: leaving
     // the turn pending keeps the drain effect braked on `if (state.turnActive)
     // return` so it does not hot-loop re-POSTing the wake while the worker is
     // still resuming. The phantom turn is retired instead on the next
-    // `AcpSessionAssigned` (the worker-online signal), which is when the drain
-    // should fire. See #3094 / #3087.
-    const idx = state.activity.findIndex((r) => r.id === action.id);
+    // `AcpSessionAssigned` (the worker-online signal). See #3094 / #3087.
+    const idx = state.optimisticRows.findIndex((r) => r.id === action.id);
     if (idx === -1) return state;
     return {
       ...state,
-      activity: state.activity.slice(0, idx).concat(state.activity.slice(idx + 1)),
+      optimisticRows: state.optimisticRows.slice(0, idx).concat(state.optimisticRows.slice(idx + 1)),
     };
   }
   if (action.kind === "enqueue_prompt") {
@@ -779,6 +865,24 @@ export function reducer(state: AcpState, action: Action): AcpState {
   return emptyAcpState();
 }
 
+/** Translate a wire {@link TranscriptDelta} (externally tagged) into the
+ *  matching reducer action, mapping the carried row to the client
+ *  {@link ActivityRow} shape. Returns null for an unrecognized shape. */
+export function transcriptDeltaAction(delta: TranscriptDelta, sessionId: string): Action | null {
+  if ("Append" in delta) {
+    if (!webRendersServerRow(delta.Append)) return null;
+    return { kind: "transcript_append", row: transcriptRowToActivity(delta.Append, sessionId) };
+  }
+  if ("Patch" in delta) {
+    if (!webRendersServerRow(delta.Patch.row)) return null;
+    return { kind: "transcript_patch", row: transcriptRowToActivity(delta.Patch.row, sessionId) };
+  }
+  if ("Remove" in delta) {
+    return { kind: "transcript_remove", id: delta.Remove };
+  }
+  return null;
+}
+
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
 
 /** Reconnect backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s (cap). Seven
@@ -850,12 +954,6 @@ export function useAcpSession(
   sweepExpiredStorage();
   const [state, dispatch] = useReducer(reducer, sessionId, initialState);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
-  // Mirror the worker state into a ref so the drain effect always sees
-  // the latest value without re-running on every poll.
-  const workerStateRef = useRef(workerState);
-  useEffect(() => {
-    workerStateRef.current = workerState;
-  }, [workerState]);
   // Mirror the triage timestamps onto refs so `sendPrompt`'s wake
   // step always sees the freshest value without forcing a re-create
   // of the callback (the dep churn would also blow `dispatchPromptNow`
@@ -868,23 +966,16 @@ export function useAcpSession(
   useEffect(() => {
     snoozedUntilRef.current = snoozedUntil;
   }, [snoozedUntil]);
-  const { replayEvents } = useAcpPrefs();
   // The `/clear`-boundary batching that used to happen here (slicing the
   // queued-prompt snapshot so `/clear` fires as its own turn) is now server-
   // side, in the queue drain (`queue_drain_batch`). See #1356 and the
-  // server-side prompt queue design.
+  // server-side prompt queue design. The activity buffer is server-owned
+  // (Tier 4) and the daemon enforces the `acp.replay_events` retention cap,
+  // so there is no longer a client-side row cap to mirror (#1111).
   //
-  // Mirror the server-side retention cap onto the reducer's
-  // in-memory activity buffer. Without this, a frontend-only 200-row
-  // cap clipped the rendered transcript regardless of what the user
-  // set on the server side (#1111). 0 means unlimited.
-  useEffect(() => {
-    setActivityLimit(replayEvents);
-  }, [replayEvents]);
-  // Mirror status into a ref so sendPrompt's stable callback can short
-  // circuit when the WS is closed without re-creating the callback on
-  // every status flip (which would invalidate downstream memoised
-  // handlers).
+  // Mirror status into a ref so the WS lifecycle can read the latest value
+  // without re-creating callbacks on every status flip (which would
+  // invalidate downstream memoised handlers).
   const statusRef = useRef<ConnectionStatus>("connecting");
   useEffect(() => {
     statusRef.current = status;
@@ -1122,17 +1213,39 @@ export function useAcpSession(
       // cache, lastSeq > 0) keeps the cheap forward seq-delta top-up.
       // See #2236.
       if (lastSeqRef.current === 0) {
-        const tailRes = await fetch(
-          `/api/sessions/${encodeURIComponent(sid)}/acp/replay?before=${TAIL_BEFORE}&limit=${REPLAY_PAGE_SIZE}`,
-          { credentials: "same-origin" },
-        );
+        // The transcript (activity) and the bulk of control state are
+        // server-owned, but the frames leg still feeds what the daemon does
+        // not model (worker latches, monitor and wakeup badges, the usage cost
+        // baseline, rejected prompts, the optimistic turn counters).
+        // `?view=rows` returns the folded rows with an EMPTY `frames`, so pull
+        // both projections of the SAME page in parallel: default frames feed
+        // the control reducer, `view=rows` feeds the transcript. Identical
+        // pagination metadata, so the frames response drives the cursors.
+        const tailParams = `before=${TAIL_BEFORE}&limit=${REPLAY_PAGE_SIZE}`;
+        const [tailRes, tailRowsRes] = await Promise.all([
+          fetch(`/api/sessions/${encodeURIComponent(sid)}/acp/replay?${tailParams}`, { credentials: "same-origin" }),
+          fetch(`/api/sessions/${encodeURIComponent(sid)}/acp/replay?${tailParams}&view=rows`, {
+            credentials: "same-origin",
+          }),
+        ]);
         if (!tailRes.ok) return;
         const tail = (await tailRes.json()) as ReplayPageResponse;
         if (tail.lost) {
           dispatch({ kind: "lagged", skipped: tail.highest_seq });
           return;
         }
-        dispatch({ kind: "frames", frames: tail.frames ?? [], oldestSeq: tail.next_cursor ?? 0 });
+        // Bail rather than render a hole: the frames leg below advances
+        // `lastSeqRef`, and the WS then drains from that cursor, so a page of
+        // rows dropped here would never be resent. Returning leaves the
+        // cursors untouched so the next hydrate retries the same page.
+        if (!tailRowsRes.ok) return;
+        const tailRows = ((await tailRowsRes.json()) as ReplayPageResponse).rows ?? [];
+        dispatch({
+          kind: "frames",
+          frames: tail.frames ?? [],
+          rows: tailRows.filter(webRendersServerRow).map((r) => transcriptRowToActivity(r, sid)),
+          oldestSeq: tail.next_cursor ?? 0,
+        });
         setHasMoreOlder(tail.has_more ?? false);
         // Advance the seq ref synchronously (the [state.lastSeq] effect
         // mirror lags a render tick) so the WS dial that follows this
@@ -1173,12 +1286,21 @@ export function useAcpSession(
       // busy session. Captured from page one's `highest_seq`.
       let target: number | null = null;
       for (;;) {
-        const res = await fetch(
-          `/api/sessions/${encodeURIComponent(sid)}/acp/replay?since=${cursor}&limit=${REPLAY_PAGE_SIZE}`,
-          { credentials: "same-origin" },
-        );
-        if (!res.ok) return;
+        // Same two-projection fetch as the cold tail: default frames for the
+        // control reducer, `view=rows` for the server-owned transcript.
+        const pageParams = `since=${cursor}&limit=${REPLAY_PAGE_SIZE}`;
+        const [res, rowsRes] = await Promise.all([
+          fetch(`/api/sessions/${encodeURIComponent(sid)}/acp/replay?${pageParams}`, { credentials: "same-origin" }),
+          fetch(`/api/sessions/${encodeURIComponent(sid)}/acp/replay?${pageParams}&view=rows`, {
+            credentials: "same-origin",
+          }),
+        ]);
+        // Both legs page the same window, so a failure on either one has to
+        // stop the loop: advancing the cursor past a page whose rows never
+        // arrived leaves a hole nothing refetches.
+        if (!res.ok || !rowsRes.ok) return;
         const data = (await res.json()) as ReplayPageResponse;
+        const pageRows = ((await rowsRes.json()) as ReplayPageResponse).rows ?? [];
         if (target === null) {
           target = data.highest_seq;
           // Detect a server-side seq reset: the supervisor's per-session
@@ -1200,8 +1322,12 @@ export function useAcpSession(
           dispatch({ kind: "lagged", skipped: data.highest_seq });
           return;
         }
-        if (data.frames.length > 0) {
-          dispatch({ kind: "frames", frames: data.frames });
+        if (data.frames.length > 0 || pageRows.length > 0) {
+          dispatch({
+            kind: "frames",
+            frames: data.frames,
+            rows: pageRows.filter(webRendersServerRow).map((r) => transcriptRowToActivity(r, sid)),
+          });
         }
         const next = data.next_cursor;
         if (data.has_more && next != null && next > cursor && next < target) {
@@ -1229,14 +1355,18 @@ export function useAcpSession(
     loadingOlderRef.current = true;
     setLoadingOlder(true);
     try {
+      // Older history is transcript-only (the prepend never re-folds control
+      // state), so a single `?view=rows` fetch suffices; no companion frames
+      // request is needed here.
       const res = await fetch(
-        `/api/sessions/${encodeURIComponent(sid)}/acp/replay?before=${before}&limit=${REPLAY_PAGE_SIZE}`,
+        `/api/sessions/${encodeURIComponent(sid)}/acp/replay?before=${before}&limit=${REPLAY_PAGE_SIZE}&view=rows`,
         { credentials: "same-origin" },
       );
       if (!res.ok) return;
       const data = (await res.json()) as ReplayPageResponse;
-      if ((data.frames ?? []).length > 0) {
-        dispatch({ kind: "prepend", frames: data.frames, oldestSeq: data.next_cursor ?? before });
+      const rows = (data.rows ?? []).filter(webRendersServerRow).map((r) => transcriptRowToActivity(r, sid));
+      if (rows.length > 0) {
+        dispatch({ kind: "prepend", rows, oldestSeq: data.next_cursor ?? before });
       }
       setHasMoreOlder(data.has_more ?? false);
     } catch {
@@ -1453,28 +1583,63 @@ export function useAcpSession(
           // busy stream keeps it fresh too. See #2287.
           lastServerMsgRef.current = Date.now();
           try {
-            const data = JSON.parse(ev.data) as AcpFrame | { kind: "lagged"; skipped?: number } | { kind: "heartbeat" };
-            if (typeof data === "object" && data !== null && (data as { kind?: unknown }).kind === "heartbeat") {
+            const data = JSON.parse(ev.data) as
+              | AcpFrame
+              | { kind: "lagged"; skipped?: number }
+              | { kind: "heartbeat" }
+              | { kind: "reduced_state" }
+              | { kind: "transcript_snapshot"; rows?: TranscriptRow[] }
+              | { kind: "transcript_delta"; delta?: TranscriptDelta };
+            const kind = typeof data === "object" && data !== null ? (data as { kind?: unknown }).kind : undefined;
+            if (kind === "heartbeat") {
               // Keepalive tick; liveness clock already bumped above.
               return;
             }
-            if (
-              typeof data === "object" &&
-              data !== null &&
-              "kind" in data &&
-              (data as { kind?: unknown }).kind === "lagged"
-            ) {
-              const skipped = (data as unknown as { skipped?: number }).skipped ?? 0;
+            if (kind === "lagged") {
+              const skipped = (data as { skipped?: number }).skipped ?? 0;
               dispatch({ kind: "lagged", skipped });
               // Try to recover via the snapshot endpoint.
               fetchReplay(sessionId);
               return;
             }
+            if (kind === "reduced_state") {
+              // Server-folded control state (Tier 1.2), sent on connect and
+              // after every event. Authoritative: the client no longer
+              // derives any of these fields.
+              const reduced = (data as { state?: ReducedState }).state;
+              if (reduced) {
+                lastActivityRef.current = Date.now();
+                const unchanged = (data as { unchanged?: string[] }).unchanged ?? [];
+                dispatch({ kind: "reduced_state", state: reduced, unchanged });
+              }
+              return;
+            }
+            if (kind === "transcript_snapshot") {
+              // Server-owned transcript connect snapshot (Tier 4). Usually
+              // empty (the WS dials at the current lastSeq); carries gap rows
+              // on a reconnect that raced live events. Merged by row id.
+              const rows = ((data as { rows?: TranscriptRow[] }).rows ?? [])
+                .filter(webRendersServerRow)
+                .map((r) => transcriptRowToActivity(r, sessionId));
+              lastActivityRef.current = Date.now();
+              dispatch({ kind: "transcript_snapshot", rows });
+              return;
+            }
+            if (kind === "transcript_delta") {
+              const delta = (data as { delta?: TranscriptDelta }).delta;
+              const act = delta ? transcriptDeltaAction(delta, sessionId) : null;
+              if (act) {
+                lastActivityRef.current = Date.now();
+                dispatch(act);
+              }
+              return;
+            }
             if (typeof data === "object" && data !== null && "session_id" in data && "event" in data) {
-              // Every incoming live frame is an "activity" tick for the
-              // force-end-turn watchdog: as long as the agent is
-              // streaming, the spinner stays "honest" and the escape
-              // hatch doesn't appear. See WorkingSpinner in StructuredView.
+              // Raw event frame: feeds the client-side CONTROL reducer only
+              // (the transcript is server-owned now). Every incoming live
+              // frame is an "activity" tick for the force-end-turn watchdog:
+              // as long as the agent is streaming, the spinner stays "honest"
+              // and the escape hatch doesn't appear. See WorkingSpinner.
               lastActivityRef.current = Date.now();
               dispatch({ kind: "frame", frame: data as AcpFrame });
             }
@@ -1579,11 +1744,11 @@ export function useAcpSession(
     [sessionId],
   );
 
-  // Dispatch a prompt immediately, no queueing. Internal helper used by
-  // both sendPrompt (when the turn is idle) and the drain effect below
-  // (when popping the head of queuedPrompts on Stopped). The result tells
-  // the drain effect what to do with the items it just sent:
-  //   - "ok": delivered, retire them.
+  // POST a prompt and report what the daemon did with it. Internal helper
+  // used by both sendPrompt and the drain effect below (when popping the head
+  // of queuedPrompts on Stopped). The result tells the drain effect what to do
+  // with the items it just sent:
+  //   - "dispatched" / "queued": the daemon accepted it, retire them.
   //   - "non_retryable_failure": the server rejected them with a 4xx, so
   //     retrying would just re-POST the same failing batch every turn-end;
   //     retire them too (the error banner already surfaced the reason).
@@ -1591,14 +1756,7 @@ export function useAcpSession(
   //     so keep the queue intact for the next turn-end retry.
   const dispatchPromptNow = useCallback(
     async (text: string, attachments?: PromptAttachmentInput[]): Promise<PromptSendResult> => {
-      if (!sessionId) return "retryable_failure";
-      if (statusRef.current !== "open") {
-        dispatch({
-          kind: "error",
-          message: "Acp disconnected; message not sent. Reconnect to retry.",
-        });
-        return "retryable_failure";
-      }
+      if (!sessionId) return { kind: "retryable_failure" };
       // Optimistic preview rows: render the attachment inline from a
       // local data URL so the bubble shows immediately, before the
       // server confirms and replay would otherwise back it with the
@@ -1611,16 +1769,19 @@ export function useAcpSession(
         size: Math.floor((a.dataB64.length * 3) / 4),
         url: `data:${a.mimeType};base64,${a.dataB64}`,
       }));
-      // Optimistically echo the user's message; the agent reply
-      // streams back as session/update events on the WS. If the POST
-      // fails with a 4xx the optimistic row stays so the user sees what
-      // they tried to send; a transient worker_not_ready 503 rolls this
-      // exact row back (by id) because the prompt is re-queued and the
-      // drain would otherwise echo a duplicate. See #3094 / #3087.
-      const optimisticId = `user-opt-${optimisticPromptId()}`;
+      // Mint a stable prompt id and render an optimistic overlay row keyed by
+      // it. The POST echoes this id as the `Event::UserPromptSent.prompt_id`,
+      // and the server-owned transcript keys the authoritative `user_prompt`
+      // row on it, so the overlay reconciles by id (dropped once the server
+      // row lands) instead of the old fragile text match. If the POST fails
+      // with a 4xx the overlay stays so the user sees what they tried to send;
+      // a transient worker_not_ready 503 rolls this exact overlay back (by id)
+      // because the prompt is re-queued and the drain would otherwise echo a
+      // duplicate. See #3173 / #3094 / #3087.
+      const promptId = optimisticPromptId();
       dispatch({
         kind: "user_prompt",
-        id: optimisticId,
+        id: promptId,
         text,
         attachments: previews.length > 0 ? previews : undefined,
       });
@@ -1631,6 +1792,7 @@ export function useAcpSession(
       try {
         const body = {
           text,
+          prompt_id: promptId,
           attachments: (attachments ?? []).map((a) => ({
             kind: a.kind,
             mime_type: a.mimeType,
@@ -1666,10 +1828,10 @@ export function useAcpSession(
           if (rejected) {
             dispatch({ kind: "prompt_send_rejected" });
           } else if (workerNotReady) {
-            // Undo the optimistic row + turn: the caller re-queues this
+            // Undo the optimistic overlay row: the caller re-queues this
             // prompt, so it must live only in the queue until the drain
             // resends it once the worker is back online. See #3094 / #3087.
-            dispatch({ kind: "rollback_optimistic_prompt", id: optimisticId });
+            dispatch({ kind: "rollback_optimistic_prompt", id: promptId });
           }
           if (!workerNotReady) {
             dispatch({
@@ -1677,15 +1839,25 @@ export function useAcpSession(
               message: `Could not send prompt (${res.status}). ${detail}`.trim(),
             });
           }
-          return rejected ? "non_retryable_failure" : "retryable_failure";
+          return { kind: rejected ? "non_retryable_failure" : "retryable_failure" };
         }
-        return "ok";
+        // The daemon reports what it did (Tier 3). A `queued` disposition means
+        // it parked the prompt rather than starting a turn, so the optimistic
+        // transcript row has to become a queue row: the turn-end drain will
+        // deliver it, and leaving the transcript row would show the message as
+        // sent while it waits.
+        const dispatched = (await safeJson<PromptDispatchBody>(res)) ?? {};
+        if (dispatched.disposition === "queued") {
+          dispatch({ kind: "rollback_optimistic_prompt", id: promptId });
+          return { kind: "queued", queuedId: dispatched.queued_id ?? promptId };
+        }
+        return { kind: "dispatched" };
       } catch (e) {
         dispatch({
           kind: "error",
           message: `Network error sending prompt: ${describeError(e)}`,
         });
-        return "retryable_failure";
+        return { kind: "retryable_failure" };
       }
     },
     [sessionId],
@@ -1720,18 +1892,16 @@ export function useAcpSession(
     [sessionId],
   );
 
-  // Public sendPrompt. Enqueues on the server whenever the session is not in
-  // a state where an immediate POST would succeed; the server drain dispatches
-  // once the session resumes. Inactive states covered:
-  //   - WS not open (disconnected, reconnecting): #1359.
-  //   - turn already in flight: #1031.
-  //   - worker not in `running` (cold start, restart, stopped): #1088.
-  //   - worker stopped or restarting at the session level: #1359.
-  // Only when every gate clears does the prompt take the immediate POST
-  // path. The guard set mirrors the drain effect below so the moment
-  // the last gate flips the parked prompts fire. dispatchPromptNow keeps
-  // its own status guard for the drain effect, which can race the WS
-  // reopen window (see #1144).
+  // Public sendPrompt. Posts unconditionally and renders whatever the daemon
+  // says it did (Tier 3, `docs/development/server-owned-prompt-dispatch.md`).
+  //
+  // This used to be a `shouldEnqueue` expression over turnActive, steering,
+  // cancelling, compacting, three worker latches, the REST worker-state poll
+  // and the socket state, each clause a fixed incident (#2805 / #1727 / #3219 /
+  // #1689) that the native TUI re-derived independently. The daemon knows all
+  // of it first-hand, so it decides and the client renders. The socket term is
+  // gone rather than moved: "can my socket reach the daemon" was always a proxy
+  // for a question the POST's own response answers.
   const sendPrompt = useCallback(
     async (text: string, attachments?: PromptAttachmentInput[]) => {
       if (!sessionId) return;
@@ -1762,72 +1932,24 @@ export function useAcpSession(
           return;
         }
       }
-      const wsClosed = statusRef.current !== "open";
-      const workerNotRunning = workerStateRef.current !== "running";
-      // An idle-auto-stopped worker is dormant, not dead: the prompt POST
-      // itself wakes it (the server clears dormancy, the reconciler
-      // respawns, and `send_prompt`'s `wait_for_worker` holds the request
-      // until the fresh worker is ready). So a dormant worker must NOT
-      // park the prompt on `workerNotRunning` (the REST poll reads
-      // "absent" until the respawn lands); parking would leave it in the
-      // local queue forever and the worker would never come back. Only a
-      // non-dormant cold worker (genuine mid-resume) still parks. See #1689.
-      // A steerable agent takes a mid-turn prompt directly: the daemon
-      // injects it into the running turn via `_session/steering` rather
-      // than refusing it, so parking here would put back the queue-after
-      // behavior steering replaces. Only the turn-active term is dropped;
-      // the socket and worker gates below still park, because steering
-      // does nothing for a prompt that cannot reach the daemon. See #2805.
-      //
-      // A pending cancel is the exception: the daemon refuses a prompt
-      // that arrives while it is cancelling AND escalates to a runner
-      // restart, reading it as "the user hit Stop and re-typed, so the
-      // agent is wedged". Steering must not route the composer into that
-      // path, or Stop-then-type would respawn the worker where it used
-      // to just queue. That turn is ending either way, so park and let
-      // the drain fire it as the next turn.
-      //
-      // A running `/compact` is the same shape of exception: that turn is
-      // only summarizing context, so the adapter answers `Injected` and
-      // swallows the message into a turn that never replies to it, with no
-      // retry affordance. Park it and let the drain fire it as the next
-      // turn, against the freshly compacted context. See #3219.
-      const turnBlocks =
-        state.turnActive && !(state.promptCapabilities?.steering && !state.cancelling && !state.compacting);
-      const blockedAsideFromWorker = wsClosed || turnBlocks || state.workerStopped || state.workerRestarting;
-      const shouldEnqueue = state.workerIdleStopped
-        ? blockedAsideFromWorker
-        : blockedAsideFromWorker || workerNotRunning;
-      if (shouldEnqueue) {
-        // Queue the prompt (with any attachments) on the SERVER, which drains
-        // it once the agent is idle, even with no tab open. The optimistic row
-        // shows immediately; the bytes ride to the server's pending-attachment
-        // store and are delivered on drain. See the server-side prompt queue.
-        enqueueServer(text, attachments);
+      const result = await dispatchPromptNow(text, attachments);
+      if (result.kind === "queued") {
+        // The daemon parked it. The row already exists server-side, so show it
+        // in the strip as confirmed rather than POSTing a second copy.
+        dispatch({ kind: "enqueue_prompt", id: result.queuedId, text, attachments });
+        dispatch({ kind: "confirm_queued_prompt", id: result.queuedId });
+        reportAcpInteraction("prompt_queued");
         return;
       }
-      const result = await dispatchPromptNow(text, attachments);
-      // Idle-dormant direct send: the worker was respawning and did not
-      // come online within send_prompt's wait window, so the POST returned
-      // a retryable typed 503. Queue the prompt server-side instead of
-      // dropping it; the server drain fires it once the worker wakes. See
-      // #1748 / #1833.
-      if (result === "retryable_failure" && state.workerIdleStopped) {
+      // A transient 503 means the daemon accepted the request but its worker
+      // did not come online within `send_prompt`'s wait window (#1748 / #1833).
+      // The prompt is not on the queue (the daemon decided to send it), so
+      // enqueue it here or it is lost.
+      if (result.kind === "retryable_failure" && state.workerIdleStopped) {
         enqueueServer(text, attachments);
       }
     },
-    [
-      sessionId,
-      state.turnActive,
-      state.promptCapabilities?.steering,
-      state.cancelling,
-      state.compacting,
-      state.workerStopped,
-      state.workerRestarting,
-      state.workerIdleStopped,
-      dispatchPromptNow,
-      enqueueServer,
-    ],
+    [sessionId, state.workerIdleStopped, dispatchPromptNow, enqueueServer],
   );
 
   // Server-queue hydration. The daemon owns the queue and drains it (even
@@ -1955,7 +2077,12 @@ export function useAcpSession(
         return;
       }
       const result = await dispatchPromptNow(prompt.text, prompt.attachments);
-      if (result === "retryable_failure") {
+      if (result.kind === "queued") {
+        // The daemon parked it again (the turn it would jump ahead of is still
+        // running). Put the row back so the strip keeps showing it.
+        dispatch({ kind: "enqueue_prompt", id: result.queuedId, text: prompt.text, attachments: prompt.attachments });
+        dispatch({ kind: "confirm_queued_prompt", id: result.queuedId });
+      } else if (result.kind === "retryable_failure") {
         // The immediate send bounced (worker still resuming); re-queue it
         // server-side so the drain re-fires it, and restore the optimistic row.
         enqueueServer(prompt.text, prompt.attachments);
@@ -2205,6 +2332,16 @@ async function safeText(res: Response): Promise<string> {
     return (await res.text()).slice(0, 200);
   } catch {
     return "";
+  }
+}
+
+/** Parse a JSON body, `null` on anything unparseable. Used where a missing or
+ *  malformed body has a sane default rather than being an error. */
+async function safeJson<T>(res: Response): Promise<T | null> {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    return null;
   }
 }
 

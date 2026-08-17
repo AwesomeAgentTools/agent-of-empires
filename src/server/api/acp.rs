@@ -1255,6 +1255,23 @@ async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
     woke_idle_dormant
 }
 
+/// `POST /api/sessions/{id}/acp/prompt` success body.
+///
+/// **Breaking**: this endpoint used to answer a bare 202 with no body. It now
+/// reports what the daemon did with the prompt, because the daemon is what
+/// decides (Tier 3). Flattened, so the wire shape is
+/// `{"disposition":"sent"}` / `{"disposition":"steered"}` /
+/// `{"disposition":"queued","reason":"cancelling","queued_id":"..."}`.
+#[derive(Debug, serde::Serialize)]
+pub struct PromptDispatchResponse {
+    #[serde(flatten)]
+    pub dispatch: crate::acp::dispatch::PromptDispatch,
+    /// The queue row's id on a `queued` disposition, so a client reconciles its
+    /// optimistic row the same way the transcript reconciles by row id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued_id: Option<String>,
+}
+
 pub async fn acp_prompt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1306,6 +1323,57 @@ pub async fn acp_prompt(
         let _serialized = inst_lock.lock().await;
         state.session_service.clear_pending_initial_turn(&id).await;
     }
+    // Tier 3: the daemon, not the client, decides whether this prompt can be
+    // sent now. See `docs/development/server-owned-prompt-dispatch.md`.
+    let dispatch = {
+        let control = crate::server::acp_ws::fold_control_state(&state, &id).await;
+        let liveness = crate::acp::dispatch::WorkerLiveness {
+            running: state.acp_supervisor.is_running(&id).await,
+            // `touch_and_wake_if_sunk` above already cleared the marker for a
+            // dormant session, so read the pre-clear answer it returned rather
+            // than the instance, which now says "awake".
+            idle_dormant: woke_idle_dormant,
+        };
+        crate::acp::dispatch::decide(&control, liveness)
+    };
+    if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
+        // Park it on the server-owned queue the turn-end drain already
+        // services. A client-minted id reconciles the caller's optimistic row;
+        // without one the server mints the id it returns.
+        let prompt_id = req
+            .prompt_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        return match super::queue::buffer_and_enqueue(
+            &state,
+            &id,
+            &prompt_id,
+            req.text.clone(),
+            &attachments,
+            None,
+            chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        {
+            Ok(entry) => (
+                StatusCode::ACCEPTED,
+                Json(PromptDispatchResponse {
+                    dispatch,
+                    queued_id: Some(entry.id),
+                }),
+            )
+                .into_response(),
+            Err((status, msg)) => {
+                tracing::warn!(
+                    target: "http.api.acp",
+                    session = %id,
+                    ?reason,
+                    "prompt dispatch chose the queue but enqueue failed: {msg}"
+                );
+                (status, msg).into_response()
+            }
+        };
+    }
     let outcome = state
         .session_service
         .send_turn(
@@ -1314,6 +1382,7 @@ pub async fn acp_prompt(
             &req.text,
             &attachments,
             woke_idle_dormant,
+            req.prompt_id.clone(),
         )
         .await;
     // Smart-rename fires from `acp_event_listener` on the first clean
@@ -1321,7 +1390,14 @@ pub async fn acp_prompt(
     // races this handler's live worker for the provider API. See
     // `session::smart_rename` and #2348.
     match outcome {
-        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(PromptDispatchResponse {
+                dispatch,
+                queued_id: None,
+            }),
+        )
+            .into_response(),
         Err(SendTurnError::SessionNotFound) => {
             (StatusCode::NOT_FOUND, "session not found").into_response()
         }
@@ -2660,15 +2736,31 @@ pub async fn acp_replay(
     let lowest_seq = page.lowest_seq;
     let next_cursor = page.last_scanned_seq;
     let has_more = page.has_more;
-    let frames: Vec<crate::server::AcpBroadcastFrame> = page
-        .events
-        .into_iter()
-        .map(|(seq, event)| crate::server::AcpBroadcastFrame {
-            session_id: id.clone(),
-            seq,
-            event: Arc::new(event),
-        })
-        .collect();
+    // `view=rows` folds THIS page through `TranscriptModel` and returns the
+    // built rows instead of raw frames, keeping the pagination metadata
+    // identical so the client's recent-first / older-page cursor logic is
+    // unchanged. Per-page folding cannot see earlier context, so a page whose
+    // `tool_start` sits in an older page relies on `TranscriptModel`'s
+    // synth-on-missing-start (already implemented; the intended behavior).
+    let want_rows = q.view.as_deref() == Some("rows");
+    let (frames, rows) = if want_rows {
+        let mut model = crate::acp::transcript::TranscriptModel::new();
+        for (seq, event) in &page.events {
+            model.apply_event(*seq, event);
+        }
+        (Vec::new(), Some(model.rows().to_vec()))
+    } else {
+        let frames: Vec<crate::server::AcpBroadcastFrame> = page
+            .events
+            .into_iter()
+            .map(|(seq, event)| crate::server::AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq,
+                event: Arc::new(event),
+            })
+            .collect();
+        (frames, None)
+    };
     // `lost = true` when the client's `since` cursor predates the oldest
     // seq still on disk. The retention cap can evict older events, so a
     // client that returns after a long absence may legitimately need a
@@ -2689,6 +2781,7 @@ pub async fn acp_replay(
         lowest_seq,
         next_cursor,
         has_more,
+        rows,
     })
     .into_response()
 }
@@ -3208,6 +3301,7 @@ mod tests {
                     Ok(Json(PromptRequest {
                         text: "lgtm".to_string(),
                         attachments: Vec::new(),
+                        prompt_id: None,
                     })),
                 )
                 .await
@@ -3257,6 +3351,87 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(state.instance_locks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acp_replay_view_rows_matches_frames_pagination() {
+        use crate::acp::transcript::TranscriptRowKind;
+        use axum::body::to_bytes;
+
+        let inst = crate::session::Instance::new("t", "/tmp");
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // Scripted session: a prompt, two assistant chunks, and a terminal
+        // Stopped. Recorded straight into the store the handler reads.
+        let events = [
+            Event::UserPromptSent {
+                text: "hello".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+            },
+            Event::AgentMessageChunk { text: "hi".into() },
+            Event::AgentMessageChunk {
+                text: " there".into(),
+            },
+            Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+        ];
+        for (i, ev) in events.iter().enumerate() {
+            state
+                .acp_event_store
+                .record(&id, i as u64 + 1, ev)
+                .expect("record");
+        }
+
+        // A small page so has_more / next_cursor are non-trivial and must
+        // match between the two projections.
+        let base = ReplayQuery {
+            since: 0,
+            limit: Some(2),
+            before: None,
+            view: None,
+        };
+        let read = |q: ReplayQuery| {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                let resp = acp_replay(State(state), Path(id), axum::extract::Query(q))
+                    .await
+                    .into_response();
+                let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                serde_json::from_slice::<ReplayResponse>(&bytes).unwrap()
+            }
+        };
+
+        // Default projection: frames, no rows, byte-shape unchanged.
+        let frames_resp = read(ReplayQuery { view: None, ..base }).await;
+        assert_eq!(frames_resp.frames.len(), 2, "page holds the first 2 events");
+        assert!(frames_resp.rows.is_none(), "no rows key on default replay");
+        assert!(frames_resp.has_more);
+
+        // `view=rows`: same page folded to rows, no frames, identical paging.
+        let rows_resp = read(ReplayQuery {
+            view: Some("rows".into()),
+            ..base
+        })
+        .await;
+        assert!(rows_resp.frames.is_empty(), "rows projection drops frames");
+        let rows = rows_resp.rows.as_ref().expect("rows present");
+        assert_eq!(
+            rows.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            vec![TranscriptRowKind::UserPrompt, TranscriptRowKind::Message],
+            "the 2-event page folds to a prompt row and one message row"
+        );
+
+        // Pagination metadata is identical across projections; only the payload
+        // differs, so the client's cursor logic is unchanged.
+        assert_eq!(rows_resp.next_cursor, frames_resp.next_cursor);
+        assert_eq!(rows_resp.has_more, frames_resp.has_more);
+        assert_eq!(rows_resp.highest_seq, frames_resp.highest_seq);
+        assert_eq!(rows_resp.lowest_seq, frames_resp.lowest_seq);
+        assert_eq!(rows_resp.lost, frames_resp.lost);
     }
 
     #[test]

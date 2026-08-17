@@ -24,7 +24,9 @@ pub mod background_agent;
 pub mod capability_probe;
 pub mod client;
 pub mod context_primer;
+pub mod control_cache;
 pub mod control_protocol;
+pub mod dispatch;
 pub mod elicitations;
 pub mod event_store;
 pub mod fs_handler;
@@ -44,6 +46,7 @@ pub mod session_tee;
 pub mod state;
 pub mod supervisor;
 pub mod terminal_handler;
+pub mod transcript;
 #[cfg(feature = "serve")]
 pub mod version_probe;
 
