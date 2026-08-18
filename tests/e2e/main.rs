@@ -45,6 +45,7 @@ mod hermes_shared_project_correlation_e2e;
 mod host_before_session_e2e;
 mod intro;
 mod kiro_launch;
+mod live_send_paste_e2e;
 mod live_takeover;
 mod logs;
 mod new_session;
