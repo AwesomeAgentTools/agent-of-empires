@@ -13,6 +13,15 @@
 
 import { expect, type Page, type WebSocketRoute } from "@playwright/test";
 
+/** Parsed `POST .../acp/prompt` request body. `prompt_id` is the
+ *  client-minted id the daemon echoes back on `UserPromptSent`, so a spec can
+ *  assert the optimistic-row correlation directly. Optional because a caller
+ *  that predates the id (or posts by hand) may omit it. */
+export interface AcpPromptBody {
+  text: string;
+  prompt_id?: string;
+}
+
 export interface AcpSessionMockOptions {
   sessionId?: string;
   title?: string;
@@ -21,7 +30,7 @@ export interface AcpSessionMockOptions {
   /** Maps a captured `POST .../acp/prompt` body to events replayed on
    *  the WS after the POST is fulfilled, standing in for the live
    *  fake-ACP agent's scripted turn. */
-  onPrompt?: (body: { text: string }) => unknown[];
+  onPrompt?: (body: AcpPromptBody) => unknown[];
   /** Same, for `POST .../acp/config-option`: the returned events play
    *  the adapter's confirming snapshot (or rejection). */
   onConfigOption?: (body: { config_id: string; value: string }) => unknown[];
@@ -36,7 +45,7 @@ export interface AcpSessionMock {
   sessionId: string;
   title: string;
   /** Parsed bodies of every `POST .../acp/prompt` the page sent. */
-  promptBodies: Array<{ text: string }>;
+  promptBodies: AcpPromptBody[];
   /** Parsed bodies of every `POST .../acp/config-option`. */
   configOptionBodies: Array<{ config_id: string; value: string }>;
   /** Parsed bodies of every `POST /api/telemetry/seen`. */
@@ -295,9 +304,16 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     });
   });
   await page.route("**/api/sessions/*/acp/prompt", async (r) => {
-    const body = JSON.parse(r.request().postData() ?? "{}") as { text: string };
+    const body = JSON.parse(r.request().postData() ?? "{}") as AcpPromptBody;
     handle.promptBodies.push(body);
     await r.fulfill({ json: {} });
+    // The daemon publishes `UserPromptSent` carrying the client-minted
+    // `prompt_id` BEFORE it forwards the prompt to the agent
+    // (`send_turn` -> `publish_user_prompt_with_attachments`). That echo is
+    // what settles the client's optimistic in-flight marker and opens the
+    // turn, so a mock that jumps straight to the agent's reply leaves the
+    // composer wedged in its "working" state. See #3417.
+    pushEvents([{ UserPromptSent: { text: body.text, prompt_id: body.prompt_id ?? null } }]);
     pushEvents(opts.onPrompt?.(body) ?? []);
   });
   await page.route("**/api/sessions/*/acp/config-option", async (r) => {

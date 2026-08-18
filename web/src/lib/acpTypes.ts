@@ -642,6 +642,7 @@ export interface ReducedState {
   available_commands: AvailableCommand[];
   available_modes: Array<{ id: string; name: string; description?: string | null }>;
   current_mode_id: string | null;
+  turn_active: boolean;
   cancelling: boolean;
   compacting: boolean;
 }
@@ -748,24 +749,35 @@ export interface AcpState {
    *  "working" spinner so the UI feels alive even when the agent
    *  isn't streaming text or running a tool yet.
    *
-   *  Derived from `pendingUserPromptSeq > lastStoppedSeq`; never
-   *  written directly. Keeping it on the state shape (instead of
+   *  Derived from `serverTurnActive || inflightPromptIds.length > 0`;
+   *  never written directly. Keeping it on the state shape (instead of
    *  exporting a selector) lets all the existing `state.turnActive`
-   *  reads stay unchanged. The counter pair is the source of truth so
-   *  a late `Stopped` from a prior turn can't clobber a fresh
-   *  follow-up that's already incremented `pendingUserPromptSeq`.
-   *  See #1170. */
+   *  reads stay unchanged. See {@link deriveTurnActive} and #3417. */
   turnActive: boolean;
-  /** Monotonic count of user prompts the client has dispatched (either
-   *  via the optimistic `user_prompt` action or via a server-confirmed
-   *  `UserPromptSent` echo that didn't match an outstanding optimistic
-   *  row). Source of truth for `turnActive`; never decremented. */
-  pendingUserPromptSeq: number;
-  /** Snapshot of `pendingUserPromptSeq` at the moment the most recent
-   *  `Stopped` (or `AgentStartupError`) arrived. `turnActive` derives
-   *  to false only when no further prompt has bumped
-   *  `pendingUserPromptSeq` past this snapshot. */
-  lastStoppedSeq: number;
+  /** The daemon's `AcpState.turn_active`, adopted verbatim from the
+   *  `reduced_state` frame. Authoritative for the steady state: the
+   *  daemon is the only party that knows whether a mid-turn prompt was
+   *  steered into the running turn (one terminal `Stopped` for many
+   *  prompts) or opened a turn of its own. See #3417 / #2805. */
+  serverTurnActive: boolean;
+  /** Client-minted prompt ids POSTed but not yet acknowledged, either by
+   *  the server's `UserPromptSent` echo or by the POST settling with a
+   *  failure. The thin optimistic overlay that covers the POST-to-echo
+   *  gap so the composer flips to "working" instantly; correlated by id
+   *  so one prompt settling cannot retire another's turn. Request-local,
+   *  never persisted. */
+  inflightPromptIds: string[];
+  /** Monotonic count of user prompts dispatched, never decremented. Bumped
+   *  by the optimistic `user_prompt` action and by any `UserPromptSent` with
+   *  no matching outstanding optimistic id (a replay, another device, a
+   *  drained queue entry), so an echo of this client's own prompt counts once.
+   *
+   *  Two readers: `useCancelEscalation` tokenises "already pressed Stop for
+   *  this prompt" as `(sessionId, promptSeq)` so the next prompt's first Stop
+   *  is graceful again (#2237), and the `SessionContextReset` arm treats zero
+   *  as "this session never had a prompt to lose" and suppresses the re-prime
+   *  offer. Deliberately not turn truth: see {@link deriveTurnActive}. */
+  promptSeq: number;
   /** Real ACP-advertised modes from the agent's NewSessionResponse,
    *  plus the agent's currently-active mode id. Empty until the
    *  agent reports them; the picker falls back to the hard-coded
@@ -1244,8 +1256,9 @@ export function emptyAcpState(): AcpState {
     incompatibleAgent: null,
     lastError: null,
     turnActive: false,
-    pendingUserPromptSeq: 0,
-    lastStoppedSeq: 0,
+    serverTurnActive: false,
+    inflightPromptIds: [],
+    promptSeq: 0,
     availableModes: [],
     currentModeId: null,
     availableCommands: [],
@@ -1274,10 +1287,6 @@ export function emptyAcpState(): AcpState {
   };
 }
 
-/** Per-turn state resets shared by every "a new user turn started"
- *  event (a plain `UserPromptSent` and a `UserDiffCommentsPrompt`).
- *  Mutates `next` in place; the caller has already appended the
- *  activity row and bumped `pendingUserPromptSeq`. */
 /** Whether a `UserPromptSent` is a message steered into the turn already
  *  running rather than the start of a new one (#2805).
  *
@@ -1288,17 +1297,25 @@ export function emptyAcpState(): AcpState {
  *  turn's single `Stopped` still has to see the output flag and the
  *  pending-cancel state the turn actually accumulated.
  *
- *  Takes the pre-event state, since the arms bump `pendingUserPromptSeq`
- *  (which feeds `isTurnActive`) before they reach the reset.
+ *  Takes the pre-event state, since the arms open the turn before they
+ *  reach the reset.
+ *
+ *  Reads `serverTurnActive`, not the rendered `turnActive`: since #3417 the
+ *  latter is also true through the POST-to-echo gap of this client's own
+ *  prompt, so an idle session's very first prompt would look steered to its
+ *  own echo and skip the resets it needs. Only the daemon's flag means "a
+ *  turn was already running".
  */
 function isSteeredContinuation(state: AcpState): boolean {
-  return state.turnActive && !!state.promptCapabilities?.steering;
+  return state.serverTurnActive && !!state.promptCapabilities?.steering;
 }
 
+/** Per-turn state resets shared by every "a new user turn started"
+ *  event (a plain `UserPromptSent` and a `UserDiffCommentsPrompt`).
+ *  Mutates `next` in place; the caller has already opened the turn. */
 function applyNewTurnResets(next: AcpState): void {
   next.startupError = null;
   next.lastError = null;
-  next.turnActive = isTurnActive(next);
   // The cancel phase itself is server-owned (a fresh non-steered turn clears
   // it there); only the escalation deadline is ours to drop. See #1727.
   next.cancelEscalatesAt = null;
@@ -1359,6 +1376,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // model: the agent reports session-lifetime cumulative cost, so each
     // boundary snapshots it to keep the footer reading "since the most recent
     // boundary". See #1354 / #1109.
+    if (event === "ThinkingStarted") {
+      // Agent-initiated work with no prompt behind it still opens a turn.
+      // Mirrors `AcpState::apply_event`; see closeTurn's note on why the raw
+      // fold tracks these edges at all.
+      next.serverTurnActive = true;
+      next.turnActive = true;
+    }
     if (event === "ConversationCompacted" || event === "SessionCleared") {
       const priorUsage = state.sessionUsage?.cost?.amount ?? 0;
       const priorBaseline = state.usageBaseline?.cost ?? 0;
@@ -1458,11 +1482,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("Stopped" in event) {
     // Final marker. Every in-turn phase it used to clear (in-flight tool,
-    // thinking, cancelling, compacting) is server-owned since Tier 1.2; what
-    // remains is the client's own turn bookkeeping. See #1170.
+    // thinking, cancelling, compacting) is server-owned since Tier 1.2, and
+    // closing the turn joined them in #3417: whether this `Stopped` ends the
+    // turn or only one of several prompts steered into it is the daemon's
+    // call, and the `reduced_state` frame that follows this event on the WS
+    // carries the answer. The raw edge is mirrored for the history fold; see
+    // closeTurn.
     next.cancelEscalatesAt = null;
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
+    closeTurn(next);
     // Clear the "monitoring" badge once the monitor has fired and that turn
     // ends. See #2325.
     if (next.monitorArmed && next.monitorWorkSeen) {
@@ -1512,21 +1539,18 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // powers the StartupErrorScreen.
     next.incompatibleAgent = event.IncompatibleAgent.detail;
     next.agentUnresponsive = false;
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
     return next;
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
     // A failed respawn supersedes any in-progress unresponsive escalation.
     next.agentUnresponsive = false;
-    // Same race-safe semantics as Stopped. See #1170.
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
+    closeTurn(next);
     return next;
   }
   if ("PromptRuntimeError" in event) {
     next.lastError = event.PromptRuntimeError.message;
+    closeTurn(next);
     return next;
   }
   if ("PromptCapabilities" in event) {
@@ -1540,17 +1564,22 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("UserPromptSent" in event) {
-    // Control-only: the transcript row is server-owned. Reconcile the turn
-    // counter against the optimistic overlay by the minted prompt_id, so a
-    // server echo of a prompt this client dispatched optimistically does not
-    // double-bump the counter (the optimistic `user_prompt` action already
-    // bumped it). A prompt with no matching optimistic row (replay, another
-    // device, a drained queue entry) bumps here. See #1170 / #3173.
+    // Control-only: the transcript row is server-owned. This is the daemon
+    // acknowledging the prompt, so it settles the matching optimistic id by
+    // the minted `prompt_id` (#3173) and opens the turn. Opening it here
+    // rather than waiting for the `reduced_state` frame that follows is the
+    // one place the client mirrors a daemon turn edge: without it, settling
+    // the id would drop `turnActive` for the single frame between the two.
+    // The following `reduced_state` stays authoritative.
     const pid = event.UserPromptSent.prompt_id;
-    const isOptimistic = pid != null && pid.length > 0 && state.optimisticRows.some((o) => o.id === pid);
-    if (!isOptimistic) {
-      next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
+    const wasInflight = pid != null && pid.length > 0 && next.inflightPromptIds.includes(pid);
+    if (wasInflight) {
+      next.inflightPromptIds = next.inflightPromptIds.filter((id) => id !== pid);
+    } else {
+      next.promptSeq += 1;
     }
+    next.serverTurnActive = true;
+    next.turnActive = true;
     if (!isSteeredContinuation(state)) {
       applyNewTurnResets(next);
     }
@@ -1558,9 +1587,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("UserDiffCommentsPrompt" in event) {
     // The "Send diff comments" dialog posts directly with no optimistic
-    // overlay, so always bump the turn counter. The typed row is
-    // server-owned.
-    next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
+    // overlay, so there is no id to settle. The typed row is server-owned.
+    next.promptSeq += 1;
+    next.serverTurnActive = true;
+    next.turnActive = true;
     if (!isSteeredContinuation(state)) {
       applyNewTurnResets(next);
     }
@@ -1578,14 +1608,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.workerIdleStopped = false;
     next.agentUnresponsive = false;
     next.agentOrphaned = false;
-    // A prompt sent to an idle-dormant worker left pendingUserPromptSeq
-    // bumped (turn pending) so the drain effect stays braked. The respawn
-    // handshake is the worker-online signal: retire that phantom turn so the
-    // drain fires. Scoped to a non-empty queue. See #3094 / #3087.
-    if (next.queuedPrompts.length > 0 && next.pendingUserPromptSeq > next.lastStoppedSeq) {
-      next.lastStoppedSeq = next.pendingUserPromptSeq;
-      next.turnActive = isTurnActive(next);
-    }
     return next;
   }
   if ("SessionContextReset" in event) {
@@ -1596,9 +1618,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // Suppress the primer offer on a session that never saw a user prompt
     // (a 0-prompt session's session/load failure is expected). The visible
     // reset row is server-owned; here we only gate the primer affordance.
-    // `pendingUserPromptSeq` counts prompts applied before this event (frames
-    // are applied in seq order), so it is the "had a prior prompt" signal.
-    if (state.pendingUserPromptSeq <= 0) {
+    // `promptSeq` counts prompts applied before this event (frames are applied
+    // in seq order), so zero is the "never had a prompt" signal.
+    if (state.promptSeq <= 0) {
       return next;
     }
     // Offer the opt-in primer affordance; one-shot, cleared by the next
@@ -1669,10 +1691,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     };
     const REJECTED_PROMPTS_CAP = 5;
     next.rejectedPrompts = [...next.rejectedPrompts, entry].slice(-REJECTED_PROMPTS_CAP);
-    // Retire the spinner for this rejected submission so the composer
-    // unlocks. See #1170.
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
+    // The composer's own optimistic marker is settled by the POST that got
+    // the rejection; this closes the turn the daemon closed. See closeTurn.
+    closeTurn(next);
     return next;
   }
   if ("BackgroundAgentLaunched" in event) {
@@ -1787,6 +1808,14 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     availableCommands: holds("available_commands") ? state.availableCommands : reduced.available_commands,
     availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
     currentModeId: reduced.current_mode_id,
+    // Steady-state turn truth. A false frame cannot suppress a prompt whose
+    // POST is still unacknowledged, so an unrelated frame arriving in that
+    // window does not flicker the composer back to idle. See #3417.
+    serverTurnActive: reduced.turn_active,
+    turnActive: deriveTurnActive({
+      serverTurnActive: reduced.turn_active,
+      inflightPromptIds: state.inflightPromptIds,
+    }),
     cancelling: reduced.cancelling,
     compacting: reduced.compacting,
     locallyResolved,
@@ -1883,19 +1912,34 @@ export function appendElicitationAnswerRow(
   });
 }
 
-/** Derived `turnActive` from the prompt / stop seq counters. Exported
- *  so any new consumer can compute it from the counters directly; the
- *  reducer also calls this to keep `state.turnActive` in lockstep so
- *  existing `state.turnActive` reads stay correct. See #1170.
+/** Rendered `turnActive`: the daemon's steady-state truth, OR'd with the
+ *  client's own unacknowledged prompt POSTs.
  *
- *  Invariant: `lastStoppedSeq <= pendingUserPromptSeq` always holds.
- *  Both counters start at 0; `pendingUserPromptSeq` increments by one
- *  on every dispatched user prompt, and `lastStoppedSeq` advances by
- *  one per `Stopped` / `AgentStartupError` but is capped at
- *  `pendingUserPromptSeq` so spurious extra Stopped frames cannot
- *  poison a future turn. */
-export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "lastStoppedSeq">): boolean {
-  return state.pendingUserPromptSeq > state.lastStoppedSeq;
+ *  This replaced a client-side `pendingUserPromptSeq > lastStoppedSeq`
+ *  counter pair, which assumed one terminal `Stopped` per prompt. Mid-turn
+ *  steering (#2805) breaks that cardinality: the daemon injects a prompt
+ *  into the running turn and deliberately emits no extra terminal event,
+ *  so N prompts closed with one `Stopped` left the counters permanently
+ *  apart and the composer stuck on Stop plus a spinner. The daemon already
+ *  models this correctly as a boolean and already ships it; the client now
+ *  adopts it. See #3417 and `docs/development/server-owned-sv-state.md`. */
+export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inflightPromptIds">): boolean {
+  return state.serverTurnActive || state.inflightPromptIds.length > 0;
+}
+
+/** Close the turn from a raw event, mirroring `AcpState::apply_event`'s own
+ *  `turn_active = false` edges (`src/acp/state.rs`).
+ *
+ *  The `reduced_state` frame the daemon pushes after every event is still
+ *  authoritative, so this looks redundant on the WS path. It is not on the
+ *  history path: `GET /acp/replay` serves raw events with no `reduced_state`
+ *  alongside, so a cold open that folded only the opening edges would paint a
+ *  spinner over a session that finished hours ago until the WS connect
+ *  snapshot corrected it. Mirroring the same seven edges the daemon uses
+ *  keeps the raw fold self-consistent. See #3417. */
+function closeTurn(next: AcpState): void {
+  next.serverTurnActive = false;
+  next.turnActive = deriveTurnActive(next);
 }
 
 /** Whether the structured view should show the compaction reminder.
@@ -1922,16 +1966,18 @@ export function isCompactionReminderDue(
   return (usage.used / usage.size) * 100 >= prefs.compactionReminderPercent;
 }
 
-/** Normalise a partial AcpState so the turn counters are populated.
- *  Used by the localStorage loader after the #1170 schema change: pre-
- *  schema persisted entries have no counters, so we backfill from the
- *  cached `turnActive` boolean (true → one outstanding prompt, false →
- *  fully retired) and re-derive `turnActive` from the counters. */
-export function normaliseTurnCounters(
+/** Normalise a partial AcpState so the turn state is populated. Used by
+ *  the localStorage loader: an entry persisted before #3417 carries the
+ *  retired `pendingUserPromptSeq` / `lastStoppedSeq` counters and no
+ *  `serverTurnActive`, so we seed the latter from the cached `turnActive`
+ *  boolean as a warm hint. The WS connect snapshot replaces it with daemon
+ *  truth a moment later. In-flight prompt ids are request-local and always
+ *  start empty: after a reload there is no POST left to acknowledge them. */
+export function normaliseTurnState(
   state: AcpState & {
     oldestSeq?: number;
-    pendingUserPromptSeq?: number;
-    lastStoppedSeq?: number;
+    serverTurnActive?: boolean;
+    promptSeq?: number;
     rejectedPrompts?: RejectedPrompt[];
     agentUnresponsive?: boolean;
     agentOrphaned?: boolean;
@@ -1942,10 +1988,14 @@ export function normaliseTurnCounters(
     compactionReminderDismissed?: SessionUsage | null;
   },
 ): AcpState {
-  const pendingUserPromptSeq =
-    typeof state.pendingUserPromptSeq === "number" ? state.pendingUserPromptSeq : state.turnActive ? 1 : 0;
-  const lastStoppedSeq =
-    typeof state.lastStoppedSeq === "number" ? state.lastStoppedSeq : state.turnActive ? 0 : pendingUserPromptSeq;
+  const serverTurnActive =
+    typeof state.serverTurnActive === "boolean" ? state.serverTurnActive : state.turnActive === true;
+  // A hydrate that already has prompt rows already had prompts; a cold entry
+  // re-folds its history and counts them on the way through.
+  const promptSeq =
+    typeof state.promptSeq === "number" && Number.isFinite(state.promptSeq)
+      ? Math.max(0, Math.floor(state.promptSeq))
+      : (state.activity ?? []).filter((r) => r.kind === "user_prompt").length;
   // Pre-#1196 persisted entries lack rejectedPrompts / agentUnresponsive;
   // backfill so the reducer and renderers see well-typed values instead
   // of `undefined` (which crashes RejectedPromptsStrip's `.length` read).
@@ -1989,8 +2039,9 @@ export function normaliseTurnCounters(
     configOptionSwitchFailed,
     pendingConfigOption,
     compactionReminderDismissed,
-    pendingUserPromptSeq,
-    lastStoppedSeq,
-    turnActive: isTurnActive({ pendingUserPromptSeq, lastStoppedSeq }),
+    serverTurnActive,
+    promptSeq,
+    inflightPromptIds: [],
+    turnActive: serverTurnActive,
   };
 }
