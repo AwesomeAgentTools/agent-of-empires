@@ -10657,9 +10657,8 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_uses_stdin_script() {
-        let original = std::env::var("SHELL").ok();
         for shell in &["/bin/bash", "/bin/zsh", "/usr/bin/fish", "/usr/bin/nu"] {
-            std::env::set_var("SHELL", shell);
+            let _shell = EnvGuard::set(&[("SHELL", shell)]);
             let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
             assert!(
                 wrapped.contains("/dev/fd/3 3<<'AOE_LAUNCH_BODY'"),
@@ -10668,33 +10667,23 @@ mod tests {
             assert!(wrapped.contains("\nstty susp undef\nexec env claude\n"));
             assert!(!wrapped.contains(" -c "));
         }
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_posix_shell_uses_login() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/bin/zsh");
+        let _shell = EnvGuard::set(&[("SHELL", "/bin/zsh")]);
         let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
             wrapped.starts_with("'/bin/zsh' -l /dev/fd/3 "),
             "POSIX shell should use a login descriptor script: {wrapped}",
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_fish_skips_login() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/usr/bin/fish");
+        let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/fish")]);
         let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         // The bash fallback must not load bash login files because the user's
         // PATH setup belongs to fish.
@@ -10702,26 +10691,17 @@ mod tests {
             wrapped.starts_with("'bash' /dev/fd/3 "),
             "fish should use a non-login bash descriptor script: {wrapped}",
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_nu_skips_login() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/usr/bin/nu");
+        let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/nu")]);
         let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
             wrapped.starts_with("'bash' /dev/fd/3 "),
             "nu should use a non-login bash descriptor script: {wrapped}",
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     /// #3265: a login shell's own profile/rc files can `cd` elsewhere
@@ -10733,8 +10713,16 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/bin/bash");
+        // The wrapper execs `$SHELL`, so it has to be a shell that exists here.
+        let Ok(bash) = which::which("bash") else {
+            eprintln!("skipping: bash not found on PATH");
+            return;
+        };
+        // The guard restores on unwind; the resolved path matters separately,
+        // because `test_support::ENV_LOCK` is taken only by `EnvGuard` and 12
+        // of the 14 `repo_config` hook tests take none, so they read this
+        // override regardless and must not read a path that cannot run.
+        let _shell = EnvGuard::set(&[("SHELL", &bash)]);
         let temp = tempfile::tempdir().unwrap();
         let working_dir = temp.path().join("some project's dir");
         std::fs::create_dir(&working_dir).unwrap();
@@ -10762,10 +10750,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             working_dir.to_string_lossy(),
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     // Additional tests for is_sandboxed
@@ -11803,7 +11787,11 @@ mod tests {
             command
                 .args(["-c", &script])
                 .env_clear()
-                .env("PATH", "/usr/bin:/bin");
+                // `env_clear` is here to control which OMP_STORE_ENV_KEYS the
+                // fingerprint folds in, not to pin a filesystem layout. The
+                // child still needs a PATH that resolves `sha256sum` / `tr`,
+                // so it inherits the caller's.
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default());
             // Pin the exact routing environment a host launch installs into the
             // pane for this HOME, so the check reproduces the fingerprint's env
             // instead of assuming the ambient OMP_STORE_ENV_KEYS are empty. They
@@ -11861,8 +11849,35 @@ mod tests {
         assert!(!command.contains("/dev/pts/*"));
         assert!(command.find("printf").unwrap() < command.rfind("exec sh -c").unwrap());
     }
+    /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux`
+    /// wins over any real one; inherited, so a host whose coreutils sit
+    /// outside the FHS layout still resolves them. `OsString` throughout: a
+    /// `PATH` entry need not be UTF-8.
+    #[cfg(unix)]
+    fn test_path_with_shim(bin: &std::path::Path) -> std::ffi::OsString {
+        // An unset or empty PATH is handled separately: `split_paths("")`
+        // yields one EMPTY entry, and an empty PATH element means the current
+        // directory, so joining it would hand the child `<shim>:` and put cwd
+        // on its PATH.
+        let Some(inherited) = std::env::var_os("PATH").filter(|p| !p.is_empty()) else {
+            return bin.as_os_str().to_os_string();
+        };
+        let entries = std::iter::once(bin.to_path_buf())
+            .chain(std::env::split_paths(&inherited))
+            .collect::<Vec<_>>();
+        std::env::join_paths(entries).expect("PATH entries contain no separator")
+    }
+
+    /// `#[serial]` because this reads the inherited PATH, and every test that
+    /// scrubs PATH process-globally carries that same default-key annotation:
+    /// `crate::acp::node`, `crate::acp::acp_client`, and
+    /// `crate::update::install`.
+    /// Not an `EnvGuard` lock: none of them takes `test_support::ENV_LOCK`, so
+    /// a guard would exclude unrelated guard users and leave this window open.
+    /// A future PATH mutator outside the default serial group would reopen it.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn omp_capture_gate_executes_nested_stdin_scripts() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -11889,7 +11904,7 @@ mod tests {
         std::fs::write(&script, outer).unwrap();
         let status = std::process::Command::new("sh")
             .arg(&script)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PATH", test_path_with_shim(&bin))
             .env("TMUX_PANE", "%1")
             .status()
             .unwrap();
@@ -11911,7 +11926,7 @@ mod tests {
         std::fs::write(&script, large_outer).unwrap();
         let status = std::process::Command::new("sh")
             .arg(&script)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PATH", test_path_with_shim(&bin))
             .env("TMUX_PANE", "%1")
             .status()
             .unwrap();
