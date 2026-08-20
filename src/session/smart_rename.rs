@@ -930,20 +930,36 @@ fn apply_terminal_title(
     let id = id.to_string();
     let new_title = new_title.map(str::to_string);
     storage.update(|instances, _groups| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            inst.smart_rename_attempted = true;
-            if let Some(t) = &new_title {
-                if title_is_auto_overwritable(inst) && &inst.title != t {
+        if let Some(index) = instances.iter().position(|instance| instance.id == id) {
+            instances[index].smart_rename_attempted = true;
+            if let Some(title) = &new_title {
+                let should_write = title_is_auto_overwritable(&instances[index])
+                    && instances[index].title != *title;
+                // `is_duplicate_session` scans every instance and does not skip
+                // this session by id, so the `title != current` half of
+                // `should_write` is what keeps a session from reading its own
+                // row as the collision. Self-exclusion by id lives in the manual
+                // rename predicate (#3411), which owns the shared surfaces.
+                let duplicate = should_write
+                    && crate::cli::add::is_duplicate_session(
+                        instances,
+                        title,
+                        &instances[index].project_path,
+                    );
+                if duplicate {
+                    tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
+                } else if should_write {
+                    let instance = &mut instances[index];
                     // The tmux session name embeds the title
                     // (Session::generate_name), and both status pollers derive
                     // the name from the current title. Rekey the live session
                     // to match, else attach/stop/poll would target a name the
                     // running pane no longer has. Best-effort, mirroring the
                     // manual TUI rename (src/tui/home/operations.rs).
-                    rekey_tmux_session(&id, &inst.title, t);
-                    tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %t, "auto-renamed terminal session");
-                    inst.title = t.clone();
-                    inst.last_auto_title = Some(t.clone());
+                    rekey_tmux_session(&id, &instance.title, title);
+                    tracing::info!(target: "smart_rename", session = %id, old = %instance.title, new = %title, "auto-renamed terminal session");
+                    instance.title = title.clone();
+                    instance.last_auto_title = Some(title.clone());
                 }
             }
         }
@@ -1401,7 +1417,10 @@ mod serve {
     /// (`title_is_auto_overwritable`), so a manual rename is never clobbered.
     /// Serializes against manual renames / worktree edits on this session via
     /// the per-session instance lock, and mirrors memory only when the storage
-    /// write actually happened so the two never diverge.
+    /// write actually happened so the two never diverge. Two further cases skip
+    /// the write silently: the generated title already equalling the current
+    /// one (a no-op, new here relative to the pre-fix unconditional write), and
+    /// another session in this profile already owning the (title, path) pair.
     pub(crate) async fn apply_auto_title(
         state: &Arc<AppState>,
         id: &str,
@@ -1419,19 +1438,46 @@ mod serve {
                 return;
             }
         };
+        // Own copies for the closure below: `storage.update` runs inside
+        // `spawn_blocking`, whose body must be `'static + Send`, so the borrowed
+        // `id`/`new_title` cannot cross the thread boundary. The in-memory
+        // mirror after the join reuses the borrowed `new_title` directly.
         let id_owned = id.to_string();
         let title_owned = new_title.to_string();
         let persisted = tokio::task::spawn_blocking(move || {
             storage.update(|instances, _groups| {
-                let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) else {
+                let Some(index) = instances
+                    .iter()
+                    .position(|instance| instance.id == id_owned)
+                else {
                     return Ok(false);
                 };
-                if title_is_auto_overwritable(inst) {
-                    inst.title = title_owned.clone();
-                    inst.last_auto_title = Some(title_owned.clone());
-                    return Ok(true);
+                // Skip a no-op rename: when the generated title already equals
+                // the current one there is nothing to write, and this same
+                // `title != current` guard is what excludes this session from
+                // its own duplicate scan below, since `is_duplicate_session`
+                // matches by (title, path) with no id filter. Id-based
+                // self-exclusion lives in the manual rename predicate (#3411).
+                let should_write = title_is_auto_overwritable(&instances[index])
+                    && instances[index].title != title_owned;
+                let duplicate = should_write
+                    && crate::cli::add::is_duplicate_session(
+                        instances,
+                        &title_owned,
+                        &instances[index].project_path,
+                    );
+                if duplicate {
+                    tracing::warn!(target: "smart_rename", session = %id_owned, title = %title_owned, "skipped duplicate auto-title");
+                    Ok(false)
+                } else if should_write {
+                    instances[index].title = title_owned.clone();
+                    // Last owned use of `title_owned`: move it into the field
+                    // rather than cloning a second time.
+                    instances[index].last_auto_title = Some(title_owned);
+                    Ok(true)
+                } else {
+                    Ok(false)
                 }
-                Ok(false)
             })
         })
         .await;
@@ -1462,6 +1508,76 @@ mod serve {
     mod tests {
         use super::*;
         use std::time::Duration;
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn apply_auto_title_skips_duplicate_title_and_path() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("default").expect("storage");
+            let mut target = crate::session::Instance::new("Franks", "/tmp/shared/");
+            target.source_profile = "default".to_string();
+            let target_id = target.id.clone();
+            let mut owner = crate::session::Instance::new("Already owned", "/tmp/shared");
+            owner.source_profile = "default".to_string();
+            storage
+                .update(|instances, _groups| {
+                    *instances = vec![target.clone(), owner.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![target, owner]);
+
+            apply_auto_title(&state, &target_id, "default", "Already owned").await;
+
+            let persisted = storage.load().unwrap();
+            assert_eq!(
+                persisted
+                    .iter()
+                    .find(|instance| instance.id == target_id)
+                    .unwrap()
+                    .title,
+                "Franks"
+            );
+            let in_memory = state.instances.read().await;
+            assert_eq!(
+                in_memory
+                    .iter()
+                    .find(|instance| instance.id == target_id)
+                    .unwrap()
+                    .title,
+                "Franks"
+            );
+        }
+
+        #[test]
+        fn is_duplicate_session_normalizes_trailing_slash() {
+            // The skip in `apply_auto_title` / `apply_terminal_title` reuses the
+            // creation predicate, which trims trailing '/' on both sides before
+            // comparing paths. Pin that normalization explicitly: an existing
+            // session at "/tmp/shared" collides with a candidate whose path
+            // differs only by a trailing slash.
+            let mut existing = crate::session::Instance::new("Already owned", "/tmp/shared");
+            existing.source_profile = "default".to_string();
+            let instances = vec![existing];
+            let cases = [
+                ("Already owned", "/tmp/shared", true),
+                // "/tmp/shared/" and "/tmp/shared" are equal after trim_end_matches('/').
+                ("Already owned", "/tmp/shared/", true),
+                // trim_end_matches removes every trailing slash, not just one.
+                ("Already owned", "/tmp/shared//", true),
+                ("Already owned", "/tmp/other", false),
+                // Same path, different title: not a duplicate.
+                ("Different", "/tmp/shared", false),
+            ];
+            for (title, path, expected) in cases {
+                assert_eq!(
+                    crate::cli::add::is_duplicate_session(&instances, title, path),
+                    expected,
+                    "title {title:?} path {path:?}"
+                );
+            }
+        }
 
         #[tokio::test]
         async fn run_oneshot_returns_none_on_spawn_failure() {
@@ -2633,16 +2749,25 @@ claude = "repo-wrapper"
         let mut manual = Instance::new("Britons", "/tmp/y");
         manual.title = "Hand-picked".to_string();
         let manual_id = manual.id.clone();
+        // Story 3: a generated title already owned at the same normalized path
+        // is skipped, but the one-shot remains marked attempted.
+        let duplicate_candidate = Instance::new("Franks", "/tmp/z/");
+        let duplicate_id = duplicate_candidate.id.clone();
+        let mut duplicate_owner = Instance::new("Saxons", "/tmp/z");
+        duplicate_owner.title = "Already owned".to_string();
         storage
             .update(|instances, _groups| {
                 instances.push(civ);
                 instances.push(manual);
+                instances.push(duplicate_candidate);
+                instances.push(duplicate_owner);
                 Ok(())
             })
             .unwrap();
 
         apply_terminal_title(&storage, &civ_id, Some("Fix login bug")).unwrap();
         apply_terminal_title(&storage, &manual_id, Some("Should Not Apply")).unwrap();
+        apply_terminal_title(&storage, &duplicate_id, Some("Already owned")).unwrap();
 
         let (instances, _) = storage.load_with_groups().unwrap();
         let civ = instances.iter().find(|i| i.id == civ_id).unwrap();
@@ -2654,5 +2779,12 @@ claude = "repo-wrapper"
         assert_eq!(manual.title, "Hand-picked");
         // Still marked attempted so the poller does not respawn on every turn.
         assert!(manual.smart_rename_attempted);
+        let duplicate = instances
+            .iter()
+            .find(|instance| instance.id == duplicate_id)
+            .unwrap();
+        assert_eq!(duplicate.title, "Franks");
+        assert_eq!(duplicate.last_auto_title, None);
+        assert!(duplicate.smart_rename_attempted);
     }
 }
