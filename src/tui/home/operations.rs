@@ -28,6 +28,21 @@ fn group_membership<'a>(
     }
 }
 
+fn rekey_tmux_after_persist(id: &str, old_title: &str, new_title: &str) -> Option<String> {
+    if old_title == new_title {
+        return None;
+    }
+    match crate::tmux::rekey_session(id, old_title, new_title) {
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", session = %id, "tmux rename failed after persistence: {error}");
+            Some(format!(
+                "Session metadata was renamed, but its live tmux session could not be rekeyed: {error}"
+            ))
+        }
+    }
+}
+
 /// Compact human readable label for the snooze status line (`"30 min"`,
 /// `"1 hr"`, `"24 hr"`, `"2 hr 30 min"`). The picker only ever submits
 /// 30 / 60 / 1440, but formatting is kept general so arbitrary values
@@ -406,6 +421,48 @@ impl HomeView {
                 return Ok(());
             }
         }
+
+        // A restart-dialog profile move owns the ordered title/source
+        // lifecycle guards before any tool/config persistence. This prevents
+        // the target seed and the eventual launch from straddling a newer
+        // source-profile mutation.
+        let source_profile = self
+            .get_instance(&id)
+            .map(|instance| instance.source_profile.clone())
+            .unwrap_or_else(|| self.config_profile());
+        let moving_profiles =
+            new_profile.is_some_and(|target_profile| target_profile != source_profile);
+        if moving_profiles {
+            let target_profile = new_profile.expect("moving_profiles requires a target");
+            let profiles = list_profiles()?;
+            if !profiles.contains(&target_profile.to_string()) {
+                anyhow::bail!("Profile '{}' does not exist", target_profile);
+            }
+        }
+        let profile_identity_guard = if moving_profiles {
+            Some(acquire_session_identity_lock()?)
+        } else {
+            None
+        };
+        let profile_move_guards = if moving_profiles {
+            Some(self.lock_session_mutation_and_reload(&id)?)
+        } else {
+            None
+        };
+        if let Some(target_profile) = new_profile.filter(|_| moving_profiles) {
+            let authoritative = self
+                .get_instance(&id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+            let target_rows = Storage::open(target_profile, self.file_watch.clone())?.load()?;
+            if is_duplicate_session(
+                target_rows.iter(),
+                &authoritative.title,
+                &authoritative.project_path,
+                None,
+            ) {
+                return Err(duplicate_session_error(&authoritative.title));
+            }
+        }
         self.restart_cooldown_at.insert(id.clone(), now);
 
         // Outside Attention sort, restart on a snoozed row clears the
@@ -451,29 +508,11 @@ impl HomeView {
             });
         }
 
-        // Apply profile move. Validates the target exists, lazily creates
-        // its Storage, and rebuilds group trees so the row renders under
-        // the new profile immediately.
+        // Apply profile move. The target was validated above; `move_to_profile`
+        // opens its existing Storage and rebuilds group trees so the row renders
+        // under the new profile immediately.
         if let Some(target_profile) = new_profile {
-            let current_profile = self
-                .get_instance(&id)
-                .map(|i| i.source_profile.clone())
-                .unwrap_or_else(|| {
-                    self.active_profile
-                        .clone()
-                        .unwrap_or_else(|| "default".to_string())
-                });
-            if target_profile != current_profile {
-                let profiles = list_profiles()?;
-                if !profiles.contains(&target_profile.to_string()) {
-                    anyhow::bail!("Profile '{}' does not exist", target_profile);
-                }
-                if !self.storages.contains_key(target_profile) {
-                    self.storages.insert(
-                        target_profile.to_string(),
-                        Storage::new(target_profile, self.file_watch.clone())?,
-                    );
-                }
+            if target_profile != source_profile {
                 if !self.group_trees.contains_key(target_profile) {
                     self.group_trees.insert(
                         target_profile.to_string(),
@@ -491,7 +530,7 @@ impl HomeView {
                     .map(|i| i.group_path.clone())
                     .unwrap_or_default();
                 self.move_to_profile(&id, target_profile, old_group_path.clone())?;
-                self.prune_empty_group(&current_profile, &old_group_path);
+                self.prune_empty_group(&source_profile, &old_group_path);
                 self.rebuild_group_trees();
                 // Rebuild the visible row list too; otherwise the row still
                 // renders under the old profile until the next reload, and
@@ -506,6 +545,15 @@ impl HomeView {
         // state. The worker owns the Starting reservation; publishing that
         // status here would make it reject its own request as concurrent.
         self.save()?;
+        drop(profile_identity_guard);
+        // A profile move retains title -> source lifecycle ordering through
+        // both profile writes. These MUST be dropped before the restart is
+        // dispatched: the launch reacquires the very same title flock (see
+        // `Instance::orchestrate_resume_launch`), and flock is not reentrant
+        // across a second open of the file, so holding the guards into the
+        // cascade would self-deadlock. The restart worker acquires its own
+        // ordered guards when it later launches the terminal.
+        drop(profile_move_guards);
 
         // The start cascade shells out to docker (image pull, container
         // create/start) and runs the before_start host hook, any of which can
@@ -821,6 +869,7 @@ impl HomeView {
 
         // Defense-in-depth: reject duplicate names (dialog validates inline, but guard here too)
         let target_profile = new_profile.unwrap_or(&ctx.old_profile);
+        let profile_changed = target_profile != ctx.old_profile;
         if new_path != ctx.old_path {
             if let Some(tree) = self.group_trees.get(target_profile) {
                 if tree.group_exists(new_path) {
@@ -833,62 +882,98 @@ impl HomeView {
             }
         }
 
-        // Validate target profile exists when moving across profiles
-        if let Some(target) = new_profile {
-            if target != ctx.old_profile {
-                let profiles = list_profiles()?;
-                if !profiles.contains(&target.to_string()) {
-                    anyhow::bail!("Profile '{}' does not exist", target);
-                }
+        if profile_changed {
+            let profiles = list_profiles()?;
+            if !profiles.contains(&target_profile.to_string()) {
+                anyhow::bail!("Profile '{}' does not exist", target_profile);
             }
         }
 
         let old_prefix = format!("{}/", ctx.old_path);
-
-        // Collect sessions belonging to this group and its descendants
         let is_member = group_membership(&ctx.old_path, &old_prefix, Some(&ctx.old_profile));
-        let affected_ids: Vec<String> = self
+        let _identity_guard = if profile_changed {
+            Some(acquire_session_identity_lock()?)
+        } else {
+            None
+        };
+        let mut affected_ids: Vec<String> = self
             .instances
             .values()
-            .filter(|i| is_member(i))
-            .map(|i| i.id.clone())
+            .filter(|instance| is_member(instance))
+            .map(|instance| instance.id.clone())
             .collect();
+        if profile_changed {
+            affected_ids.sort();
+        }
 
-        // Update group_path (and optionally source_profile) for all affected sessions
+        let _mutation_guards = if profile_changed {
+            let mut guards = Vec::with_capacity(affected_ids.len());
+            for id in &affected_ids {
+                guards.push(self.lock_session_mutation_and_reload(id)?);
+            }
+            let now = chrono::Utc::now();
+            for id in &affected_ids {
+                let authoritative = self
+                    .get_instance(id)
+                    .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+                anyhow::ensure!(
+                    authoritative.source_profile == ctx.old_profile && is_member(authoritative),
+                    "Group membership changed while the cross-profile move was pending"
+                );
+                anyhow::ensure!(
+                    authoritative.status != Status::Creating
+                        && !authoritative.has_fresh_lifecycle_reservation(now),
+                    "Cannot move group while session {id} has a lifecycle operation in progress"
+                );
+            }
+            if !self.storages.contains_key(target_profile) {
+                self.storages.insert(
+                    target_profile.to_string(),
+                    Storage::open(target_profile, self.file_watch.clone())?,
+                );
+            }
+            Some(guards)
+        } else {
+            None
+        };
+
+        let mut changes = Vec::with_capacity(affected_ids.len());
         for id in &affected_ids {
+            let instance = self
+                .get_instance(id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
             let new_group_path = if new_path != ctx.old_path {
-                let inst = self.get_instance(id);
-                match inst {
-                    Some(i) if i.group_path == ctx.old_path => new_path.to_string(),
-                    Some(i) => format!("{}{}", new_path, &i.group_path[ctx.old_path.len()..]),
-                    None => continue,
+                if instance.group_path == ctx.old_path {
+                    new_path.to_string()
+                } else {
+                    let rest = instance
+                        .group_path
+                        .strip_prefix(&old_prefix)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Group membership changed while the cross-profile move was pending"
+                            )
+                        })?;
+                    format!("{new_path}/{rest}")
                 }
             } else {
-                match self.get_instance(id) {
-                    Some(i) => i.group_path.clone(),
-                    None => continue,
-                }
+                instance.group_path.clone()
             };
+            changes.push((id.clone(), new_group_path));
+        }
 
+        // Update group_path (and optionally source_profile) for all affected sessions.
+        for (id, new_group_path) in changes {
             if let Some(tp) = new_profile {
-                self.move_to_profile(id, tp, new_group_path.clone())?;
+                self.move_to_profile(&id, tp, new_group_path)?;
             } else {
-                self.apply_user_action(id, |inst| {
+                self.apply_user_action(&id, |inst| {
                     inst.group_path = new_group_path.clone();
                 })?;
             }
         }
 
-        // Ensure target profile storage exists when moving across profiles
-        if let Some(tp) = new_profile {
-            if tp != ctx.old_profile && !self.storages.contains_key(tp) {
-                self.storages
-                    .insert(tp.to_string(), Storage::new(tp, self.file_watch.clone())?);
-            }
-        }
-
         let path_changed = new_path != ctx.old_path;
-        let profile_changed = new_profile.is_some_and(|p| p != ctx.old_profile);
 
         // Capture old_path and its descendants from the pre-rebuild tree:
         // rebuild_group_trees below derives groups from instance.group_path,
@@ -948,20 +1033,51 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        let snapshot = self.get_instance(&id).map(|i| {
-            (
-                i.worktree_info.clone(),
-                i.status,
-                i.project_path.clone(),
-                i.is_sandboxed(),
-            )
-        });
-        let Some((worktree_info, status, project_path, is_sandboxed)) = snapshot else {
-            anyhow::bail!("Session not found");
-        };
+        let live = self
+            .get_instance(&id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+        let source_profile = live.source_profile.clone();
+        let _identity_lock = acquire_session_identity_lock()?;
+        let storage = Storage::new(&source_profile, self.file_watch.clone())?;
+        let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
+        let authoritative_instances = storage.load()?;
+        let mut authoritative = authoritative_instances
+            .iter()
+            .find(|instance| instance.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+        authoritative.source_profile.clone_from(&source_profile);
+        authoritative.merge_runtime_from_reload(&live);
+        self.instances.insert(id.clone(), authoritative.clone());
+        let worktree_info = authoritative.worktree_info.clone();
+        let status = authoritative.status;
+        let project_path = authoritative.project_path.clone();
+        let is_sandboxed = authoritative.is_sandboxed();
         let Some(worktree_info) = worktree_info else {
             anyhow::bail!("Session does not use a worktree");
         };
+        let duplicate_path = crate::session::worktree_edit::target_worktree_path(
+            std::path::Path::new(&project_path),
+            new_name,
+        )
+        .unwrap_or_else(|| std::path::PathBuf::from(&project_path))
+        .to_string_lossy()
+        .into_owned();
+        if duplicate_path.trim_end_matches('/') != project_path.trim_end_matches('/')
+            && is_duplicate_session(
+                authoritative_instances.iter(),
+                &authoritative.title,
+                &duplicate_path,
+                Some(&id),
+            )
+        {
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                "Rename Failed",
+                &duplicate_session_error(&authoritative.title).to_string(),
+            ));
+            return Ok(());
+        }
         if status.blocks_worktree_edit() {
             anyhow::bail!("Stop the session before editing its workdir name");
         }
@@ -1016,6 +1132,7 @@ impl HomeView {
                 }
             }
         })?;
+        drop(_identity_lock);
 
         self.rebuild_group_trees();
         self.save()?;
@@ -1112,36 +1229,29 @@ impl HomeView {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
             let current_profile = live.source_profile.clone();
-            // The app-wide guard covers profile-changing renames too, so the
-            // authoritative target-profile check and both profile writes are
-            // one identity transaction without nesting profile locks.
+            let title_changed_by_user = !new_title.is_empty() && new_title != live.title;
+            // The app-wide identity guard covers profile-changing renames too.
+            // Existing-session guards nest beneath it in the order session
+            // title -> source lifecycle -> profile Storage.
             let _identity_lock = acquire_session_identity_lock()?;
-            let stored = if let Some(storage) = self.storages.get(&current_profile) {
-                storage.load()?
-            } else {
-                Storage::new(&current_profile, self.file_watch.clone())?.load()?
-            };
-            let mut previous = stored
-                .into_iter()
-                .find(|instance| instance.id == id)
+            let _mutation_guards = self.lock_session_mutation_and_reload(&id)?;
+            let previous = self
+                .get_instance(&id)
+                .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-            previous.source_profile.clone_from(&current_profile);
-            previous.merge_runtime_from_reload(&live);
-            self.instances.insert(id.clone(), previous.clone());
             let current_title = previous.title.clone();
             let current_group = previous.group_path.clone();
 
-            // Determine effective title (keep current if empty)
-            let effective_title = if new_title.is_empty() {
+            // Empty or dialog-unchanged text means preserve the authoritative
+            // source title, never the snapshot captured before the locks.
+            let effective_title = if !title_changed_by_user {
                 current_title.clone()
             } else {
                 new_title.to_string()
             };
-
-            // Determine effective group
             let effective_group = match new_group {
-                None => current_group.clone(), // Keep current
-                Some(g) => g.to_string(),      // Set new (empty string means ungroup)
+                None => current_group.clone(),
+                Some(group) => group.to_string(),
             };
 
             let target_profile = new_profile.unwrap_or(&current_profile);
@@ -1170,7 +1280,7 @@ impl HomeView {
                 let candidates = if let Some(storage) = self.storages.get(target_profile) {
                     storage.load()?
                 } else {
-                    Storage::new(target_profile, self.file_watch.clone())?.load()?
+                    Storage::open(target_profile, self.file_watch.clone())?.load()?
                 };
                 if is_duplicate_session(
                     candidates.iter(),
@@ -1286,51 +1396,20 @@ impl HomeView {
             // Handle profile change (move session to different profile)
             if let Some(target_profile) = new_profile {
                 if target_profile != current_profile {
-                    // Get the instance to move
-                    let mut instance = self
-                        .get_instance(&id)
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-
-                    // Apply title and group changes to the instance
-                    instance.title = effective_title.clone();
-                    instance.group_path = effective_group.clone();
-
-                    // Handle tmux rename if title changed
-                    if let Some(orig_inst) = self.get_instance(&id) {
-                        if orig_inst.title != effective_title {
-                            let tmux_session = orig_inst.tmux_session()?;
-                            if tmux_session.exists() {
-                                let new_tmux_name =
-                                    crate::tmux::Session::generate_name(&id, &effective_title);
-                                if let Err(e) = tmux_session.rename(&new_tmux_name) {
-                                    tracing::warn!(target: "tui.home", "Failed to rename tmux session: {}", e);
-                                } else {
-                                    crate::tmux::refresh_session_cache();
-                                }
-                            }
-                        }
+                    // Validate target profile exists
+                    let profiles = list_profiles()?;
+                    if !profiles.contains(&target_profile.to_string()) {
+                        anyhow::bail!("Profile '{}' does not exist", target_profile);
                     }
 
-                    // Ensure target profile storage exists
-                    if !self.storages.contains_key(target_profile) {
-                        self.storages.insert(
-                            target_profile.to_string(),
-                            Storage::new(target_profile, self.file_watch.clone())?,
-                        );
-                    }
-
-                    // Update source_profile and save (handles moving between profiles)
-                    instance.source_profile = target_profile.to_string();
-                    let new_title = instance.title.clone();
                     let moved_path = new_path.clone();
                     let moved_branch = new_branch.clone();
-                    self.move_to_profile(&id, target_profile, instance.group_path.clone())?;
+                    self.move_to_profile(&id, target_profile, effective_group.clone())?;
                     // apply_user_action (not mutate_instance + save) so a tied
                     // worktree's moved project_path actually persists; save()
                     // via merge_from_tui does not write project_path. (#1927)
                     self.apply_user_action(&id, |inst| {
-                        inst.title = new_title.clone();
+                        inst.title = effective_title.clone();
                         if let Some(path) = &moved_path {
                             inst.project_path = path.clone();
                         }
@@ -1362,22 +1441,15 @@ impl HomeView {
                         }
                     }
                     self.save()?;
+                    drop(_identity_lock);
+                    let tmux_warning =
+                        rekey_tmux_after_persist(&id, &current_title, &effective_title);
                     self.reload()?;
-                    return Ok(());
-                }
-            }
-
-            // Rename tmux session BEFORE mutating the instance, so we can
-            // look up the session by its current (old) name.
-            if current_title != effective_title {
-                let old_tmux_session = crate::tmux::Session::new(&id, &current_title)?;
-                if old_tmux_session.exists() {
-                    let new_tmux_name = crate::tmux::Session::generate_name(&id, &effective_title);
-                    if let Err(e) = old_tmux_session.rename(&new_tmux_name) {
-                        tracing::warn!(target: "tui.home", "Failed to rename tmux session: {}", e);
-                    } else {
-                        crate::tmux::refresh_session_cache();
+                    if let Some(warning) = tmux_warning {
+                        self.info_dialog =
+                            Some(InfoDialog::new("Rename Saved with Warning", &warning));
                     }
+                    return Ok(());
                 }
             }
 
@@ -1393,6 +1465,8 @@ impl HomeView {
                     }
                 }
             })?;
+            drop(_identity_lock);
+            let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
 
             // Rebuild group trees and create group if needed
             self.rebuild_group_trees();
@@ -1406,8 +1480,10 @@ impl HomeView {
                 }
             }
             self.save()?;
-
             self.reload()?;
+            if let Some(warning) = tmux_warning {
+                self.info_dialog = Some(InfoDialog::new("Rename Saved with Warning", &warning));
+            }
         }
         Ok(())
     }

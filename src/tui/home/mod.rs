@@ -72,6 +72,16 @@ enum CreationCommit {
     Duplicate(Box<Instance>),
 }
 
+/// Cross-process guards for a single-session title mutation or profile move.
+/// The source profile's lifecycle flock is intentionally nested inside the
+/// per-session title flock; callers retain this value through durable
+/// persistence and any tmux rekey so a terminal launch cannot observe the
+/// transition halfway through.
+pub(super) struct SessionMutationGuards {
+    _session_title: crate::session::StorageFlock,
+    _lifecycle: crate::session::StorageFlock,
+}
+
 /// The GroupTree identity key for a session in project mode. Worktree sessions
 /// key on `main_repo_path` (so all branches of a repo group together); other
 /// sessions key on the last segment of `project_path`. Scratch sessions key on
@@ -6745,30 +6755,105 @@ impl HomeView {
         }
     }
 
+    /// Acquire the per-session title flock followed by the source profile's
+    /// per-instance lifecycle flock, then replace the TUI snapshot with the
+    /// authoritative source row. Only TUI-owned launch configuration is merged
+    /// from the snapshot; lifecycle/runtime fields always remain the values
+    /// reloaded under the source lifecycle lock.
+    pub(super) fn lock_session_mutation_and_reload(
+        &mut self,
+        id: &str,
+    ) -> anyhow::Result<SessionMutationGuards> {
+        let snapshot = self
+            .instances
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+        let source_profile = snapshot.source_profile.clone();
+        let session_title = crate::session::acquire_session_title_lock(id)
+            .map_err(|error| anyhow::anyhow!("failed to acquire session title lock: {error}"))?;
+        if !self.storages.contains_key(&source_profile) {
+            self.storages.insert(
+                source_profile.clone(),
+                Storage::open(&source_profile, self.file_watch.clone())?,
+            );
+        }
+        let storage = self
+            .storages
+            .get(&source_profile)
+            .expect("source storage was registered above");
+        let lifecycle = storage
+            .acquire_instance_lifecycle_lock(id)
+            .map_err(|error| {
+                anyhow::anyhow!("failed to acquire session lifecycle lock: {error}")
+            })?;
+        // Read-only: both flocks (title + lifecycle) are already held above, so
+        // a plain `load()` gives the authoritative on-disk row without going
+        // through `update()`, which would unconditionally rewrite sessions.json
+        // and fire a `notify_local_change` even when nothing changed. Callers
+        // like `move_group_to_profile` acquire these guards per member in a
+        // loop, so an update-per-read would be N identical rewrites.
+        let mut authoritative = storage
+            .load()?
+            .into_iter()
+            .find(|instance| instance.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found in source profile: {id}"))?;
+        let authoritative_generation = authoritative.lifecycle_generation;
+        let authoritative_status = authoritative.status;
+        let authoritative_idle_entered_at = authoritative.idle_entered_at;
+        let authoritative_last_accessed_at = authoritative.last_accessed_at;
+        authoritative.merge_runtime_from_reload(&snapshot);
+        authoritative.merge_from_tui(&snapshot);
+        authoritative.source_profile.clone_from(&source_profile);
+        authoritative.lifecycle_generation = authoritative_generation;
+        authoritative.status = authoritative_status;
+        authoritative.idle_entered_at = authoritative_idle_entered_at;
+        authoritative.last_accessed_at =
+            authoritative_last_accessed_at.max(snapshot.last_accessed_at);
+        self.instances.insert(id.to_string(), authoritative);
+        Ok(SessionMutationGuards {
+            _session_title: session_title,
+            _lifecycle: lifecycle,
+        })
+    }
+
     /// Cross-profile move: structurally distinct from `mutate_instance`
     /// because the row must be tombstoned in the old profile's disk file
     /// AND marked as TUI-new for the target profile. Without this, save()'s
     /// per-profile loop misclassifies the row as peer-deleted in the new
     /// profile and leaves the old profile's disk row, which next reload
     /// resurrects under the original profile.
+    ///
+    /// Callers that need cross-process title/lifecycle serialization retain
+    /// [`SessionMutationGuards`] around this mutation and its durable save.
     pub(super) fn move_to_profile(
         &mut self,
         id: &str,
         target: &str,
         new_group_path: String,
     ) -> anyhow::Result<()> {
-        let Some(old_profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
+        let now = chrono::Utc::now();
+        let Some((old_profile, lifecycle_reserved)) = self.instances.get(id).map(|instance| {
+            (
+                instance.source_profile.clone(),
+                instance.has_fresh_lifecycle_reservation(now),
+            )
+        }) else {
             return Ok(());
         };
         if old_profile == target {
             self.mutate_instance(id, |inst| inst.group_path = new_group_path);
             return Ok(());
         }
+        anyhow::ensure!(
+            !lifecycle_reserved,
+            "Cannot move session {id} between profiles while a lifecycle operation is in progress"
+        );
 
         if !self.storages.contains_key(target) {
             self.storages.insert(
                 target.to_string(),
-                Storage::new(target, self.file_watch.clone())?,
+                Storage::open(target, self.file_watch.clone())?,
             );
         }
 
