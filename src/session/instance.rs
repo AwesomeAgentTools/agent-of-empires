@@ -1945,20 +1945,27 @@ impl Instance {
     ///
     /// `status` and `idle_entered_at` ARE generation-governed: a strictly newer
     /// disk snapshot (a peer's `commit_reserved_lifecycle_status`) must win over
-    /// the stale in-memory copy. `last_error`/`last_error_check` are NOT: no
-    /// lifecycle writer (`reserve_/commit_/advance_lifecycle_generation`)
-    /// produces an authoritative peer value for them. The only on-disk value is
-    /// the one `reconcile_from_disk` round-trips back from this same in-memory
-    /// poller state, so there is nothing to defer to and the in-memory value
-    /// always wins. Gating it on the generation would let an unrelated
-    /// generation bump (stop/unarchive, which pass `status: None`) discard a
-    /// freshly poller-derived `TMUX_SESSION_GONE_ERROR`, leaving the row stuck
-    /// at `Error`+`None`.
+    /// the stale in-memory copy. `last_error`/`last_error_check`,
+    /// `ever_confirmed_present`, and
+    /// `unknown_since` are NOT generation-governed: no lifecycle writer
+    /// (`reserve_/commit_/advance_lifecycle_generation`) produces an
+    /// authoritative peer value for them. The reachability sentinels are
+    /// serde-skipped, and the only on-disk error value is the one
+    /// `reconcile_from_disk` round-trips back from this same in-memory poller
+    /// state. The in-memory values therefore always win. Gating them on the
+    /// generation would let an unrelated bump discard a poller's confirmed
+    /// reachability and unknown streak, or a freshly derived
+    /// `TMUX_SESSION_GONE_ERROR`, leaving the row stuck at `Error`+`None`.
     pub(crate) fn merge_runtime_from_reload(&mut self, previous: &Self) {
         if self.lifecycle_generation <= previous.lifecycle_generation {
             self.status = previous.status;
             self.idle_entered_at = previous.idle_entered_at;
         }
+        // Reachability sentinels are runtime-only just like poller errors. A
+        // lifecycle generation bump does not make serde-skipped defaults from
+        // disk authoritative.
+        self.ever_confirmed_present = previous.ever_confirmed_present;
+        self.unknown_since = previous.unknown_since;
         self.last_error = previous.last_error.clone();
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
@@ -4659,9 +4666,8 @@ impl Instance {
     }
 
     fn install_codex_host_hooks(&self, events: &[crate::agents::ResolvedHookEvent]) {
-        match crate::hooks::codex_hooks_json_path_for_host_environment(
-            &self.profile_host_environment(),
-        ) {
+        let environment = self.resolved_host_environment();
+        match crate::hooks::codex_hooks_json_path_for_host_environment(&environment) {
             Ok(hooks_path) => {
                 if let Err(e) = crate::hooks::install_hooks(
                     &hooks_path,
@@ -4685,10 +4691,8 @@ impl Instance {
         // Install hooks in the agent's host settings file, honoring a
         // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
         // land where the agent actually reads them.
-        match crate::hooks::agent_settings_path_for_host_environment(
-            hook_cfg,
-            &self.profile_host_environment(),
-        ) {
+        let environment = self.resolved_host_environment();
+        match crate::hooks::agent_settings_path_for_host_environment(hook_cfg, &environment) {
             Ok(settings_path) => {
                 if let Err(e) = crate::hooks::install_hooks(
                     &settings_path,
@@ -7570,6 +7574,40 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
     false
 }
 
+/// Find another session that owns the exact title and normalized path.
+///
+/// `exclude_id` lets mutation paths ignore the row being renamed.
+pub(crate) fn find_duplicate_session<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+    title: &str,
+    path: &str,
+    exclude_id: Option<&str>,
+) -> Option<&'a Instance> {
+    let normalized_path = path.trim_end_matches('/');
+    instances.into_iter().find(|inst| {
+        exclude_id != Some(inst.id.as_str())
+            && inst.project_path.trim_end_matches('/') == normalized_path
+            && inst.title == title
+    })
+}
+
+pub(crate) fn is_duplicate_session<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+    title: &str,
+    path: &str,
+    exclude_id: Option<&str>,
+) -> bool {
+    find_duplicate_session(instances, title, path, exclude_id).is_some()
+}
+
+pub(crate) fn duplicate_session_error(title: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Session already exists with same title and path: {}\n\
+         Tip: use a different title or remove the existing session first",
+        title
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7633,6 +7671,27 @@ mod tests {
         for (name, pane, expected) in cases {
             assert_eq!(summarize_error_from_pane(pane), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn duplicate_session_normalizes_path_and_excludes_self() {
+        let first = Instance::new("main", "/tmp/repo/");
+        let second = Instance::new("other", "/tmp/repo");
+        let instances = vec![first.clone(), second.clone()];
+
+        assert!(is_duplicate_session(&instances, "main", "/tmp/repo", None));
+        assert!(!is_duplicate_session(
+            &instances,
+            "main",
+            "/tmp/repo/",
+            Some(&first.id)
+        ));
+        assert!(!is_duplicate_session(
+            &instances,
+            "other",
+            "/tmp/elsewhere",
+            None
+        ));
     }
 
     #[test]
@@ -7926,18 +7985,22 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_codex_hook_installer_uses_profile_codex_home() {
+    fn test_codex_hook_installer_uses_resolved_codex_home() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
-        let codex_home = tmp.path().join("profile-codex-home");
+        let profile_codex_home = tmp.path().join("profile-codex-home");
+        let resolved_codex_home = tmp.path().join("before-session-codex-home");
         let profile_dir = crate::session::get_profile_dir("codex-profile").unwrap();
         std::fs::write(
             profile_dir.join("config.toml"),
-            format!("environment = [\"CODEX_HOME={}\"]\n", codex_home.display()),
+            format!(
+                "environment = [\"CODEX_HOME={}\"]\n",
+                profile_codex_home.display()
+            ),
         )
         .unwrap();
 
@@ -7945,13 +8008,18 @@ mod tests {
         inst.tool = "codex".to_string();
         inst.detect_as = "codex".to_string();
         inst.source_profile = "codex-profile".to_string();
+        inst.pending_host_env = vec![(
+            "CODEX_HOME".to_string(),
+            resolved_codex_home.to_string_lossy().into_owned(),
+        )];
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        let hooks_path = codex_home.join("hooks.json");
+        let hooks_path = resolved_codex_home.join("hooks.json");
         let hooks = std::fs::read_to_string(hooks_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&hooks).unwrap();
         assert!(parsed["hooks"]["PreToolUse"].is_array());
         assert!(hooks.contains("aoe-hooks"));
+        assert!(!profile_codex_home.join("hooks.json").exists());
         assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
 
@@ -8989,6 +9057,22 @@ mod tests {
         // last_error is runtime-only: the in-memory poller value survives even a
         // newer generation, since no lifecycle writer persists last_error.
         assert_eq!(reloaded.last_error.as_deref(), Some("old observation"));
+    }
+
+    #[test]
+    fn runtime_reload_preserves_reachability_sentinels_across_generation_bump() {
+        let mut previous = Instance::new("session", "/tmp/test");
+        previous.lifecycle_generation = 3;
+        previous.ever_confirmed_present = true;
+        let unknown_since = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        previous.unknown_since = Some(unknown_since);
+
+        let mut reloaded = Instance::new("session", "/tmp/test");
+        reloaded.lifecycle_generation = 4;
+        reloaded.merge_runtime_from_reload(&previous);
+
+        assert!(reloaded.ever_confirmed_present);
+        assert_eq!(reloaded.unknown_since, Some(unknown_since));
     }
 
     #[test]

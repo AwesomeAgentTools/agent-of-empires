@@ -50,10 +50,27 @@ pub fn worktree_leaf_from_title(title: &str) -> String {
 /// The single source of truth for the sanitizer chain (git-ref sanitizer, then
 /// the path-safe one) so [`worktree_move_required`] cannot drift from the
 /// operation it gates.
-fn target_worktree_path(current_path: &Path, new_name: &str) -> Option<PathBuf> {
+pub(crate) fn target_worktree_path(current_path: &Path, new_name: &str) -> Option<PathBuf> {
     let parent = current_path.parent()?;
     let new_leaf = sanitize_branch_name(&git_sanitize_branch_name(new_name));
     Some(parent.join(new_leaf))
+}
+
+/// The tied-rename destination directory for `title`, as a string: the path
+/// [`edit_worktree_workdir`] would move `current_path` to, or `current_path`
+/// unchanged when it has no parent to rename within.
+///
+/// Single source for the destination the duplicate-identity check keys on
+/// across the CLI, server, and TUI rename paths: it slugs `title` to a
+/// sibling leaf ([`worktree_leaf_from_title`]) and resolves the move target
+/// ([`target_worktree_path`]), so the uniqueness gate always tests the exact
+/// path the directory would land on rather than the row's current path.
+pub(crate) fn derived_worktree_path(current_path: &Path, title: &str) -> String {
+    let leaf = worktree_leaf_from_title(title);
+    target_worktree_path(current_path, &leaf)
+        .unwrap_or_else(|| current_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Whether a workdir edit for `new_name` would actually move the worktree
