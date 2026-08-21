@@ -6562,12 +6562,12 @@ impl Instance {
         self.kill_all_tmux_sessions_uncoordinated();
     }
 
-    /// Break-glass teardown after force-removal has durably deleted the row.
+    /// Tear down tmux resources when no durable lifecycle row exists.
     ///
-    /// A lifecycle reservation cannot be acquired once the row is absent.
-    /// Force-removal is limited to an already-Deleting row, so no launch can
-    /// race this idempotent cleanup.
-    pub(crate) fn kill_all_tmux_sessions_after_forced_removal(&self) {
+    /// Used after force-removal and when rolling back an instance that failed
+    /// before its row was committed. With no row, lifecycle reservation is
+    /// impossible; callers must already know the id cannot race a launch.
+    pub(crate) fn kill_all_tmux_sessions_without_lifecycle_row(&self) {
         self.kill_all_tmux_sessions_uncoordinated();
     }
 
@@ -7577,80 +7577,62 @@ mod tests {
     use tracing_test::traced_test;
 
     #[test]
-    fn summarize_omp_banner_uses_message_above_anchor() {
-        // #3377: the omp error banner's dismissal footer anchors the reason
-        // extraction; the message line above it (glyph stripped) is returned.
-        let pane = "────\n\
-                     ✘ 401 Incorrect API key provided: sk-dummy.\n\
-                     Dismissed when you send your next message.\n\
-                     ────\n\
-                     ╭── π  > GPT-5.6 Sol ─╮\n\
-                     ╰─                   ─╯";
-        assert_eq!(
-            summarize_error_from_pane(pane),
-            "401 Incorrect API key provided: sk-dummy."
-        );
-    }
+    fn summarize_error_from_pane_handles_banner_shapes() {
+        let cases = [
+            (
+                "message above anchor",
+                "────\n\
+                 ✘ 401 Incorrect API key provided: sk-dummy.\n\
+                 Dismissed when you send your next message.\n\
+                 ────\n\
+                 ╭── π  > GPT-5.6 Sol ─╮\n\
+                 ╰─                   ─╯",
+                "401 Incorrect API key provided: sk-dummy.",
+            ),
+            (
+                "multiline message",
+                "────\n\
+                 ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n\
+                    This is a continuation with more detail.\n\
+                    And a third line.\n\
+                 Dismissed when you send your next message.\n\
+                 ────\n\
+                 ╭── π  > GPT-5.6 Sol ─╮\n\
+                 ╰─                   ─╯",
+                "429 Too Many Requests (rate limited). Retry after 30s. This is a continuation with more detail. And a third line.",
+            ),
+            (
+                "terminal lines below stale banner",
+                "────\n\
+                 ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n\
+                 Dismissed when you send your next message.\n\
+                 ────\n\
+                 Error: Retry budget exhausted after 10 retries: Unable to connect. Is the computer able to access the url?\n\
+                 Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?\n\
+                 ╭── π  > GPT-5.6 Sol ─╮\n\
+                 ╰─                   ─╯",
+                "Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?",
+            ),
+            (
+                "no banner",
+                "building failed: no such file\n╭── π  > GPT-5.6 Sol ─╮\n╰─   ─╯",
+                "building failed: no such file",
+            ),
+            (
+                "anchor without message",
+                "────\n\
+                 Dismissed when you send your next message.\n\
+                 ────\n\
+                 building failed: no such file\n\
+                 ╭── π  > GPT-5.6 Sol ─╮\n\
+                 ╰─                   ─╯",
+                "building failed: no such file",
+            ),
+        ];
 
-    #[test]
-    fn summarize_omp_banner_joins_multiline_message() {
-        // A wrapped banner message (continuation lines indented) is joined
-        // with single spaces, borders and the anchor excluded.
-        let pane = "────\n\
-                     ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n\
-                        This is a continuation with more detail.\n\
-                        And a third line.\n\
-                     Dismissed when you send your next message.\n\
-                     ────\n\
-                     ╭── π  > GPT-5.6 Sol ─╮\n\
-                     ╰─                   ─╯";
-        assert_eq!(
-            summarize_error_from_pane(pane),
-            "429 Too Many Requests (rate limited). Retry after 30s. This is a continuation with more detail. And a third line."
-        );
-    }
-
-    #[test]
-    fn summarize_prefers_terminal_lines_below_a_stale_banner() {
-        // When the terminal retry lines sit below the anchor, the word list
-        // picks them instead of the stale banner (lowest signal wins).
-        let pane = "────\n\
-                     ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n\
-                     Dismissed when you send your next message.\n\
-                     ────\n\
-                     Error: Retry budget exhausted after 10 retries: Unable to connect. Is the computer able to access the url?\n\
-                     Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?\n\
-                     ╭── π  > GPT-5.6 Sol ─╮\n\
-                     ╰─                   ─╯";
-        assert_eq!(
-            summarize_error_from_pane(pane),
-            "Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?"
-        );
-    }
-
-    #[test]
-    fn summarize_without_banner_keeps_word_list_behavior() {
-        let pane = "building failed: no such file\n╭── π  > GPT-5.6 Sol ─╮\n╰─   ─╯";
-        assert_eq!(
-            summarize_error_from_pane(pane),
-            "building failed: no such file"
-        );
-    }
-
-    #[test]
-    fn summarize_falls_back_when_anchor_has_no_message_lines() {
-        // A banner whose dismissal footer is immediately under the top border
-        // has no collectable message lines: fall through to the word list.
-        let pane = "────\n\
-                     Dismissed when you send your next message.\n\
-                     ────\n\
-                     building failed: no such file\n\
-                     ╭── π  > GPT-5.6 Sol ─╮\n\
-                     ╰─                   ─╯";
-        assert_eq!(
-            summarize_error_from_pane(pane),
-            "building failed: no such file"
-        );
+        for (name, pane, expected) in cases {
+            assert_eq!(summarize_error_from_pane(pane), expected, "{name}");
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, PreviewSelection, Vie
 use crate::session::{GroupTree, Instance, Item, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
-use crate::tui::dialogs::{InfoDialog, NewSessionDialog};
+use crate::tui::dialogs::{InfoDialog, NewSessionData, NewSessionDialog};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -7131,20 +7131,38 @@ fn test_has_dialog_true_when_search_active() {
     assert!(view.has_dialog());
 }
 
-/// Verify that the async CreationPoller path returns a session ID from
-/// `apply_creation_results` once the background thread finishes. This is
-/// the code path that was previously starved by continuous input events
-/// in the tokio::select! event loop (see #633).
-#[test]
-#[serial]
-fn test_apply_creation_results_returns_session_id() {
-    use crate::tui::dialogs::NewSessionData;
+/// Shared fixture for the async-creation finalization tests: a fresh
+/// single-commit git repo under a temp `$HOME`, a `HomeView` bound to the
+/// `default` profile in manual-group mode, and an unwatched `Storage` handle
+/// onto the same profile. Each test spawns a real background builder against
+/// this repo, so the setup is factored out rather than duplicated.
+struct CreationTestEnv {
+    view: HomeView,
+    storage: Storage,
+    project_dir: std::path::PathBuf,
+    _guard: AppDirGuard,
+    _temp: TempDir,
+}
 
+fn setup_creation_test_env() -> CreationTestEnv {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
 
     let project_dir = temp.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
+    {
+        let repo = git2::Repository::init(&project_dir).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        std::fs::write(project_dir.join("README.md"), "test\n").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+    }
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(
@@ -7157,11 +7175,24 @@ fn test_apply_creation_results_returns_session_id() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    let data = NewSessionData {
+    let storage = Storage::new_unwatched("default").unwrap();
+    CreationTestEnv {
+        view,
+        storage,
+        project_dir,
+        _guard,
+        _temp: temp,
+    }
+}
+
+/// Base new-session data targeting the shared repo. Callers tweak the
+/// title/group and worktree fields per scenario.
+fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> NewSessionData {
+    NewSessionData {
         profile: "default".to_string(),
-        title: "Async Test".to_string(),
+        title: title.to_string(),
         path: project_dir.to_str().unwrap().to_string(),
-        group: String::new(),
+        group: group.to_string(),
         tool: "claude".to_string(),
         worktree_enabled: false,
         worktree_branch: None,
@@ -7177,30 +7208,307 @@ fn test_apply_creation_results_returns_session_id() {
         scratch: false,
         fork_seed: None,
         structured: false,
-    };
+    }
+}
 
-    // Use the async CreationPoller path (pass None hooks, non-sandbox,
-    // but call request_creation directly to force the async path)
-    view.request_creation(data, None);
-    assert!(view.is_creation_pending());
-
-    // Wait for the background thread to finish (should be near-instant
-    // for non-sandbox, non-hook creation)
+/// Pump `apply_creation_results` until the background builder delivers a
+/// result, returning the finalized session id (`Some`) or the rollback outcome
+/// (`None`). Consuming the result clears `is_creation_pending`, so this
+/// terminates once a result lands; it fails the test on timeout rather than
+/// looping forever. Centralizes the poll so the tests carry no bespoke timing
+/// loops of their own.
+fn drain_creation_result(view: &mut HomeView) -> Option<String> {
     let start = std::time::Instant::now();
-    let mut session_id = None;
-    while start.elapsed() < std::time::Duration::from_secs(5) {
+    loop {
         if let Some(id) = view.apply_creation_results() {
-            session_id = Some(id);
-            break;
+            return Some(id);
         }
+        if !view.is_creation_pending() {
+            return None;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "background creation timed out"
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
 
-    let session_id = session_id.expect("apply_creation_results should return Some(session_id)");
+/// The async CreationPoller result must replace a `Creating` stub even when an
+/// intervening TUI save already persisted it, keep the finalized row's group,
+/// and treat the committed row as authoritative: it is not a provisional
+/// pending add, and a later peer deletion is not resurrected by `save`.
+#[test]
+#[serial]
+fn apply_creation_results_finalizes_persisted_stub() {
+    let CreationTestEnv {
+        mut view,
+        storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+
+    view.request_creation(
+        creation_data(&project_dir, "Async Test", "async-success"),
+        None,
+    );
+    assert!(view.is_creation_pending());
+    let stub_id = view
+        .creating_stub_id
+        .clone()
+        .expect("request should install a Creating stub");
+    view.save().unwrap();
+    let (persisted_while_creating, groups_while_creating) = storage.load_with_groups().unwrap();
+    assert_eq!(persisted_while_creating.len(), 1);
+    assert_eq!(persisted_while_creating[0].id, stub_id);
+    assert_eq!(
+        persisted_while_creating[0].status,
+        crate::session::Status::Creating
+    );
+    assert!(
+        groups_while_creating
+            .iter()
+            .any(|group| group.path == "async-success"),
+        "the intervening save should persist the stub's provisional group"
+    );
+
+    let session_id = drain_creation_result(&mut view)
+        .expect("apply_creation_results should return Some(session_id)");
+    assert!(
+        view.creating_provisional_group_paths.is_empty(),
+        "finalization must leave no provisional group paths behind"
+    );
     assert!(
         view.get_instance(&session_id).is_some(),
         "created session should be findable after apply_creation_results"
     );
+    assert!(
+        !view
+            .pending_added
+            .get("default")
+            .is_some_and(|pending| pending.contains(&session_id)),
+        "a row committed by finalization is not a provisional pending add"
+    );
+    let (persisted_after_finalization, groups_after_finalization) =
+        storage.load_with_groups().unwrap();
+    assert_eq!(
+        persisted_after_finalization.len(),
+        1,
+        "finalization should replace the persisted stub with one real row"
+    );
+    assert_eq!(persisted_after_finalization[0].id, session_id);
+    assert!(
+        persisted_after_finalization
+            .iter()
+            .all(|instance| instance.id != stub_id
+                && instance.status != crate::session::Status::Creating),
+        "the persisted Creating stub must not survive finalization"
+    );
+    assert!(
+        groups_after_finalization
+            .iter()
+            .any(|group| group.path == "async-success"),
+        "the finalized row's group should remain persisted"
+    );
+    assert!(
+        view.get_instance(&stub_id).is_none(),
+        "the in-memory Creating stub must be replaced too"
+    );
+
+    storage
+        .update(|instances, _groups| {
+            instances.retain(|instance| instance.id != session_id);
+            Ok(())
+        })
+        .unwrap();
+    view.save().unwrap();
+    assert!(
+        view.get_instance(&session_id).is_none(),
+        "save must evict the peer-deleted finalized row from memory"
+    );
+    assert!(
+        !storage
+            .load()
+            .unwrap()
+            .iter()
+            .any(|instance| instance.id == session_id),
+        "a peer-deleted finalized row must not be resurrected by save"
+    );
+}
+
+/// A peer can commit the same title/path while the background builder waits for
+/// finalization. The duplicate rollback must preserve every resource the
+/// persisted winner references (worktree, branch) and its own pre-existing
+/// empty group, while discarding the losing stub's provisional group, both in
+/// memory and across a later save.
+#[test]
+#[serial]
+fn apply_creation_results_rolls_back_on_peer_collision() {
+    let CreationTestEnv {
+        mut view,
+        storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+
+    // Use a real created branch/worktree so rollback proves it preserves
+    // resources referenced by the persisted winner.
+    let preexisting_group = "existing-empty";
+    let transient_group = "existing-empty/collision";
+    view.group_trees
+        .get_mut("default")
+        .expect("default profile should have a group tree")
+        .create_group(preexisting_group);
+    view.save().unwrap();
+    assert!(
+        storage
+            .load_with_groups()
+            .unwrap()
+            .1
+            .iter()
+            .any(|group| group.path == preexisting_group),
+        "the parent group must be intentionally persisted before the request"
+    );
+    let branch = "raced-worktree";
+    let mut raced = creation_data(&project_dir, "Raced title", transient_group);
+    raced.worktree_enabled = true;
+    raced.worktree_branch = Some(branch.to_string());
+    raced.create_new_branch = true;
+    view.request_creation(raced, None);
+    let raced_stub_id = view
+        .creating_stub_id
+        .clone()
+        .expect("raced request should install a Creating stub");
+    view.save().unwrap();
+    let (raced_rows, raced_groups) = storage.load_with_groups().unwrap();
+    assert!(raced_rows.iter().any(|instance| {
+        instance.id == raced_stub_id && instance.status == crate::session::Status::Creating
+    }));
+    assert!(
+        raced_groups
+            .iter()
+            .any(|group| group.path == transient_group),
+        "the intervening save should persist the raced stub's child group"
+    );
+
+    let main_repo_path = project_dir.canonicalize().unwrap();
+    let git = crate::git::GitWorktree::new(main_repo_path.clone()).unwrap();
+    let start = std::time::Instant::now();
+    let winner_path = loop {
+        if let Some(path) = git
+            .list_worktrees()
+            .unwrap()
+            .into_iter()
+            .find(|worktree| worktree.branch.as_deref() == Some(branch))
+            .map(|worktree| worktree.path)
+        {
+            break path;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "background worktree creation timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    let mut owner = Instance::new("Raced title", winner_path.to_str().unwrap());
+    owner.source_profile = "default".to_string();
+    owner.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: branch.to_string(),
+        main_repo_path: main_repo_path.to_string_lossy().into_owned(),
+        managed_by_aoe: false,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let owner_id = owner.id.clone();
+    storage
+        .update(|instances, _groups| {
+            instances.push(owner);
+            Ok(())
+        })
+        .unwrap();
+
+    let unexpected_id = drain_creation_result(&mut view);
+    assert_eq!(unexpected_id, None);
+    assert!(
+        view.creating_provisional_group_paths.is_empty(),
+        "rollback must leave no provisional group paths behind"
+    );
+    assert!(view.info_dialog.is_some());
+    assert!(
+        winner_path.is_dir(),
+        "rollback must preserve the winner's worktree"
+    );
+    assert!(
+        git.list_worktrees()
+            .unwrap()
+            .iter()
+            .any(|worktree| worktree.path == winner_path),
+        "winner worktree must remain registered"
+    );
+    assert!(
+        git2::Repository::open(&main_repo_path)
+            .unwrap()
+            .find_branch(branch, git2::BranchType::Local)
+            .is_ok(),
+        "rollback must preserve the winner's branch"
+    );
+    assert!(
+        view.group_trees.get("default").is_none_or(|tree| tree
+            .get_all_groups()
+            .iter()
+            .all(|group| group.path != transient_group)),
+        "duplicate rejection must discard the stub's provisional group"
+    );
+    assert!(
+        view.group_trees
+            .get("default")
+            .is_some_and(|tree| tree.group_exists(preexisting_group)),
+        "duplicate rejection must preserve an intentionally pre-existing empty group"
+    );
+
+    view.save().unwrap();
+    let (persisted, groups) = storage.load_with_groups().unwrap();
+    assert_eq!(
+        persisted
+            .iter()
+            .filter(|instance| {
+                instance.title == "Raced title"
+                    && std::path::Path::new(&instance.project_path) == winner_path
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        persisted.len(),
+        1,
+        "duplicate rejection should leave only the authoritative peer row"
+    );
+    assert!(
+        persisted.iter().all(|instance| {
+            instance.id != raced_stub_id && instance.status != crate::session::Status::Creating
+        }),
+        "duplicate rejection must remove the persisted Creating stub"
+    );
+    assert!(
+        groups.iter().all(|group| group.path != transient_group),
+        "a later save must not persist the rejected stub's group"
+    );
+    assert!(
+        groups.iter().any(|group| group.path == preexisting_group),
+        "a later save must preserve the pre-existing empty parent group"
+    );
+
+    storage
+        .update(|instances, _groups| {
+            instances.retain(|instance| instance.id != owner_id);
+            Ok(())
+        })
+        .unwrap();
+    git.remove_worktree(&winner_path, true).unwrap();
+    git.delete_branch(branch).unwrap();
 }
 
 #[test]
@@ -16250,85 +16558,40 @@ mod live_send_mode {
         }
 
         #[test]
-        fn printable_paste_stays_one_literal() {
-            assert_eq!(
-                split_paste_for_live_send("hello world"),
-                vec![lit("hello world")],
-            );
-        }
+        fn paste_shapes_are_normalized_and_dispatched() {
+            let cases = [
+                ("printable", "hello world", vec![lit("hello world")]),
+                ("multiline", "first\nsecond", paste("first\nsecond")),
+                ("trailing newline", "only line\n", paste("only line\n")),
+                ("leading newline", "\nbody", paste("\nbody")),
+                // Windows and legacy-Mac line endings normalize to LF in the
+                // payload; tmux translates LF to CR while performing the paste.
+                ("crlf to lf", "a\r\nb", paste("a\nb")),
+                ("bare cr to lf", "a\rb", paste("a\nb")),
+                (
+                    "single-line tab",
+                    "a\tb",
+                    vec![lit("a"), named("Tab"), lit("b")],
+                ),
+                ("multiline tab", "a\tb\nc", paste("a\tb\nc")),
+                // BEL and ESC have no safe mapping and are dropped.
+                (
+                    "single-line control bytes",
+                    "a\x07b\x1bc",
+                    vec![lit("a"), lit("b"), lit("c")],
+                ),
+                ("multiline control bytes", "a\x07b\x1bc\nd", paste("abc\nd")),
+                (
+                    "drag-select multiline",
+                    "alpha beta\nsecond line\nthird",
+                    paste("alpha beta\nsecond line\nthird"),
+                ),
+                ("multiline utf8", "café\n🚀", paste("café\n🚀")),
+            ];
 
-        #[test]
-        fn newline_wraps_in_bracketed_paste() {
-            // Two-line paste travels as one tmux paste. Without it the
-            // agent treats the `\n` as Enter -> submit and posts each
-            // line as its own user message (#1546).
-            assert_eq!(
-                split_paste_for_live_send("first\nsecond"),
-                paste("first\nsecond"),
-            );
-        }
-
-        #[test]
-        fn trailing_newline_stays_inside_bracketed_paste() {
-            // A single line plus a trailing newline still wraps: the
-            // user gets a paste with a trailing CR in the agent's input
-            // buffer rather than a paste-then-submit. Lets the user
-            // review before sending.
-            assert_eq!(
-                split_paste_for_live_send("only line\n"),
-                paste("only line\n"),
-            );
-        }
-
-        #[test]
-        fn leading_newline_stays_inside_bracketed_paste() {
-            assert_eq!(split_paste_for_live_send("\nbody"), paste("\nbody"));
-        }
-
-        #[test]
-        fn crlf_coalesces_to_single_cr() {
-            // Windows-style line endings collapse to one newline so the
-            // agent doesn't see a double newline.
-            assert_eq!(split_paste_for_live_send("a\r\nb"), paste("a\nb"));
-        }
-
-        #[test]
-        fn bare_cr_becomes_cr_inside_bracketed_paste() {
-            assert_eq!(split_paste_for_live_send("a\rb"), paste("a\nb"));
-        }
-
-        #[test]
-        fn tab_in_single_line_paste_emits_named_tab() {
-            // Single-line tab pastes stay on the historical path.
-            assert_eq!(
-                split_paste_for_live_send("a\tb"),
-                vec![lit("a"), named("Tab"), lit("b")],
-            );
-        }
-
-        #[test]
-        fn tab_in_multiline_paste_rides_as_raw_byte() {
-            // Inside a paste, tab is a literal character of the paste
-            // content, not a key event, so it rides in the payload.
-            assert_eq!(split_paste_for_live_send("a\tb\nc"), paste("a\tb\nc"),);
-        }
-
-        #[test]
-        fn other_control_bytes_are_dropped_in_single_line_path() {
-            // BEL (0x07) and ESC (0x1b) have no safe paste mapping;
-            // they're dropped to avoid surprising agent input cancels.
-            assert_eq!(
-                split_paste_for_live_send("a\x07b\x1bc"),
-                vec![lit("a"), lit("b"), lit("c")],
-            );
-        }
-
-        #[test]
-        fn other_control_bytes_are_dropped_inside_bracketed_paste() {
-            // Same drop policy applies inside the paste: an embedded
-            // ESC could prematurely close the paste sequence on the
-            // agent's side, so we strip it rather than forward.
-            assert_eq!(split_paste_for_live_send("a\x07b\x1bc\nd"), paste("abc\nd"),);
+            for (name, input, expected) in cases {
+                assert_eq!(split_paste_for_live_send(input), expected, "{name}");
+            }
         }
 
         /// The bug: we used to hand-roll `\e[200~` / `\e[201~` into the
@@ -16354,18 +16617,6 @@ mod live_send_mode {
         }
 
         #[test]
-        fn multiline_drag_select_paste_round_trip() {
-            // Exact shape that comes back from drag-select copy: lines
-            // joined with `\n` and no trailing newline. After the fix
-            // for #1546 this travels as one paste so the agent sees one
-            // paste instead of three Enter keypresses.
-            assert_eq!(
-                split_paste_for_live_send("alpha beta\nsecond line\nthird"),
-                paste("alpha beta\nsecond line\nthird"),
-            );
-        }
-
-        #[test]
         fn multiline_paste_dispatches_as_one_payload() {
             // Single-dispatch: the entire paste is one `Paste` action, so
             // the worker fires exactly one `load-buffer` + `paste-buffer`
@@ -16377,15 +16628,6 @@ mod live_send_mode {
                 TmuxKey::Paste(_) => {}
                 other => panic!("expected Paste, got {other:?}"),
             }
-        }
-
-        #[test]
-        fn multiline_paste_with_utf8_preserves_bytes() {
-            // Non-ASCII chars (emoji, accented letters) ride as their
-            // UTF-8 byte sequences so the agent receives the same text
-            // the user copied. Regression guard for any future "ASCII
-            // only" filter.
-            assert_eq!(split_paste_for_live_send("café\n🚀"), paste("café\n🚀"),);
         }
 
         #[test]
