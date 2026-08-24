@@ -3397,10 +3397,7 @@ fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
     let Some(raw) = probe_version_bounded(path) else {
         return false;
     };
-    raw.split_whitespace()
-        .filter_map(|tok| semver::Version::parse(tok.trim_start_matches('v')).ok())
-        .next()
-        .is_some_and(|found| found < min)
+    crate::acp::version_probe::whitespace_token_below_floor(&raw, min)
 }
 
 /// Run `<path> --version` with a deadline and return its stdout.
