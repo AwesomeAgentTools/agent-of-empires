@@ -17,7 +17,7 @@ use crate::session::profile_config::resolve_config_or_warn;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::{
     handle_tool_config_key, profile_cycler_spans, render_tool_config_overlay,
-    tool_config_suffix_spans, tool_cycler_spans, ToolConfigOutcome,
+    tool_config_suffix_spans, tool_cycler_spans, tool_lifecycle_spans, ToolConfigOutcome,
 };
 use crate::tui::styles::Theme;
 
@@ -518,9 +518,16 @@ impl RestartDialog {
         );
         let has_config =
             !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
+        // Lifecycle is the load-bearing status: append it before the config
+        // metadata. The compact configured hint keeps (configured) Ctrl+P
+        // visible in the dialog's real 60-column inner width.
+        let lifecycle_spans = tool_lifecycle_spans(value, theme);
+        let compact_config = !lifecycle_spans.is_empty();
+        spans.extend(lifecycle_spans);
         spans.extend(tool_config_suffix_spans(
             has_config,
             self.is_tool_field(),
+            compact_config,
             theme,
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -963,6 +970,54 @@ mod tests {
                 assert_eq!(data.extra_args, None);
             }
             _ => panic!("Expected Submit"),
+        }
+    }
+
+    #[test]
+    fn deprecated_tool_badge_renders_on_constrained_configured_restart_row() {
+        // Real dialog geometry: 64 columns leaves a 60-column inner row. With
+        // three tools, a configured command, and extra args, this fails if the
+        // lifecycle suffix moves behind the trailing configuration metadata.
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let cases = [("gemini", true), ("claude", false)];
+        for (tool, deprecated) in cases {
+            let mut dialog = RestartDialog::new(
+                "fix bug",
+                "default",
+                tool,
+                "custom-wrapper",
+                "--model long --verbose",
+                vec!["default".to_string()],
+                vec![
+                    "claude".to_string(),
+                    "codex".to_string(),
+                    "gemini".to_string(),
+                ],
+            );
+            dialog.focused_field = 1;
+            let mut terminal = Terminal::new(TestBackend::new(64, 14)).expect("terminal");
+            let theme = crate::tui::styles::Theme::default();
+            terminal
+                .draw(|frame| dialog.render(frame, frame.area(), &theme))
+                .expect("render");
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert_eq!(
+                content.contains("⚠ deprecated"),
+                deprecated,
+                "{tool}: {content}"
+            );
+            assert!(content.contains("(configured)"), "{tool}: {content}");
+            assert!(content.contains("Ctrl+P"), "{tool}: {content}");
+            if deprecated {
+                assert!(content.contains("(configured) Ctrl+P"), "{content}");
+            }
         }
     }
 }
