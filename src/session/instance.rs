@@ -11973,11 +11973,16 @@ mod tests {
         );
     }
 
-    /// Seed the process-global `agent_detect_as` registry for one profile.
-    /// The registry is profile-keyed and `install_from_config` only replaces
-    /// the named profile's entries, so a test-only profile name keeps these
-    /// hermetic without serializing against every other registry writer.
-    fn install_aliases(profile: &str, aliases: &[(&str, &str)]) {
+    /// Seed the process-global `agent_detect_as` registry for one profile
+    /// and return a guard that restores the profile's prior entries on drop:
+    /// `install_from_config` replaces the whole profile's state and the
+    /// registry outlives every test, so the caller must keep the returned
+    /// guard alive for the duration of its reads.
+    fn install_aliases(
+        profile: &str,
+        aliases: &[(&str, &str)],
+    ) -> crate::tmux::status_rules::ProfileRegistryGuard {
+        let guard = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
         let mut config = crate::session::Config::default();
         for (agent, target) in aliases {
             config
@@ -11986,6 +11991,7 @@ mod tests {
                 .insert(agent.to_string(), target.to_string());
         }
         crate::tmux::status_rules::install_from_config(profile, &config);
+        guard
     }
 
     /// A custom-agent row whose stored `detect_as` is empty must still resolve
@@ -11997,7 +12003,7 @@ mod tests {
     #[test]
     fn empty_detect_as_still_resolves_the_launch_agent() {
         const PROFILE: &str = "detect-as-launch-path-test";
-        install_aliases(PROFILE, &[("claude-personal", "claude")]);
+        let _registry = install_aliases(PROFILE, &[("claude-personal", "claude")]);
 
         let mut inst = Instance::new("orch", "/tmp/x");
         inst.source_profile = PROFILE.to_string();
@@ -12022,7 +12028,7 @@ mod tests {
     #[test]
     fn swap_tool_reresolves_detect_as() {
         const PROFILE: &str = "detect-as-swap-test";
-        install_aliases(
+        let _registry = install_aliases(
             PROFILE,
             &[("claude-personal", "claude"), ("codex-personal", "codex")],
         );
