@@ -2121,6 +2121,25 @@ impl HomeView {
                     );
                 }
             }
+            // Heal a managed worktree whose directory was moved outside aoe
+            // (a `git worktree move` from another shell): rewrite project_path
+            // from git so attach, status, diff, and rename all act on the live
+            // location instead of failing. Only rows whose recorded path is
+            // already gone cost anything. See #2002.
+            let mut reconcile_cache = crate::session::worktree_reconcile::ReconcileCache::default();
+            for instance in &mut instances {
+                if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+                    &storage,
+                    instance,
+                    &mut reconcile_cache,
+                ) {
+                    tracing::warn!(
+                        target: "tui.home",
+                        session = %instance.id,
+                        "worktree path reconciliation skipped: {error}",
+                    );
+                }
+            }
             // Clear expired lifecycle reservations only while holding the same
             // per-instance flock used by live transitions.
             let ttl = crate::session::Instance::LIFECYCLE_RESERVATION_TTL;
