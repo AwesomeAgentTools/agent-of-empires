@@ -69,7 +69,10 @@ impl Instance {
     ///
     /// `status` and `idle_entered_at` ARE generation-governed: a strictly newer
     /// disk snapshot (a peer's `commit_reserved_lifecycle_status`) must win over
-    /// the stale in-memory copy. `last_error`/`last_error_check`,
+    /// the stale in-memory copy. A Purge reservation is the exception: its
+    /// generation bump deliberately leaves the durable status unchanged, so an
+    /// in-memory `Deleting` overlay stays authoritative until the result
+    /// arrives. `last_error`/`last_error_check`,
     /// `ever_confirmed_present`, and
     /// `unknown_since` are NOT generation-governed: no lifecycle writer
     /// (`reserve_/commit_/advance_lifecycle_generation`) produces an
@@ -81,7 +84,12 @@ impl Instance {
     /// reachability and unknown streak, or a freshly derived
     /// `TMUX_SESSION_GONE_ERROR`, leaving the row stuck at `Error`+`None`.
     pub(crate) fn merge_runtime_from_reload(&mut self, previous: &Self) {
-        if self.lifecycle_generation <= previous.lifecycle_generation {
+        let purge_in_flight = previous.status == Status::Deleting
+            && self.lifecycle_reservation_is_owned(
+                LifecycleOperation::Purge,
+                self.lifecycle_generation,
+            );
+        if self.lifecycle_generation <= previous.lifecycle_generation || purge_in_flight {
             self.status = previous.status;
             self.idle_entered_at = previous.idle_entered_at;
         }
@@ -514,6 +522,35 @@ mod tests {
         // last_error is runtime-only: the in-memory poller value survives even a
         // newer generation, since no lifecycle writer persists last_error.
         assert_eq!(reloaded.last_error.as_deref(), Some("old observation"));
+
+        let mut deleting = Instance::new("deleting", "/tmp/test");
+        deleting.lifecycle_generation = 3;
+        deleting.status = Status::Deleting;
+
+        let mut reserved = deleting.clone();
+        reserved.lifecycle_generation = 4;
+        reserved.status = Status::Idle;
+        reserved.lifecycle_reservation = Some(LifecycleReservation {
+            op: LifecycleOperation::Purge,
+            generation: 4,
+            at: Utc::now(),
+        });
+        reserved.merge_runtime_from_reload(&deleting);
+
+        assert_eq!(reserved.lifecycle_generation, 4);
+        assert_eq!(reserved.status, Status::Deleting);
+
+        let mut launch_reserved = reserved.clone();
+        launch_reserved.status = Status::Stopped;
+        launch_reserved.lifecycle_reservation.as_mut().unwrap().op = LifecycleOperation::Launch;
+        launch_reserved.merge_runtime_from_reload(&deleting);
+
+        assert_eq!(launch_reserved.lifecycle_generation, 4);
+        assert_eq!(
+            launch_reserved.status,
+            Status::Stopped,
+            "only a Purge reservation may preserve the Deleting overlay"
+        );
     }
 
     #[test]
