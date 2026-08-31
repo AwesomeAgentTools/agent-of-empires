@@ -912,29 +912,39 @@ fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
 /// for a panic button with a handful of sessions; if counts grow, batch the
 /// SIGTERM across all pids, wait once, then SIGKILL survivors.
 pub fn stop_all_sessions() -> anyhow::Result<usize> {
-    let output = tmux_command()
+    let output = tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
         .map_err(|e| anyhow::anyhow!("tmux list-sessions spawn failed: {e}"))?;
 
-    let mut killed = 0;
-    if output.status.success() {
+    let mut matched = false;
+    let killed = if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if is_aoe_session(line) {
-                if let Some(pid) = crate::process::get_pane_pid(line) {
-                    crate::process::kill_process_tree(pid);
-                }
-                let _ = tmux_command().args(["kill-session", "-t", line]).output();
-                killed += 1;
+        stop_aoe_sessions(stdout.lines(), |name| {
+            matched = true;
+            if let Some(pid) = crate::process::get_pane_pid(name) {
+                crate::process::kill_process_tree(pid);
             }
-        }
-    }
+            utils::kill_session_if_present(name).is_ok()
+        })
+    } else {
+        0
+    };
 
-    if killed > 0 {
+    if matched {
         refresh_session_cache();
     }
     Ok(killed)
+}
+
+fn stop_aoe_sessions<'a>(
+    names: impl Iterator<Item = &'a str>,
+    mut stop: impl FnMut(&str) -> bool,
+) -> usize {
+    names
+        .filter(|name| is_aoe_session(name))
+        .filter(|name| stop(name))
+        .count()
 }
 
 /// Batch-fetch pane metadata for all aoe sessions in a single tmux subprocess call.
@@ -1425,7 +1435,7 @@ fn refresh_pane_meta_cache() {
 }
 
 pub fn get_current_session_name() -> Option<String> {
-    let output = tmux_command()
+    let output = tmux_query_command()
         .args(["display-message", "-p", "#{session_name}"])
         .output()
         .ok()?;
@@ -1680,6 +1690,22 @@ mod tests {
                 .is_some_and(|(_, value)| value.is_none()),
             "LC_ALL must not override LC_MESSAGES=C"
         );
+    }
+
+    #[test]
+    fn stop_aoe_sessions_counts_only_successful_kills() {
+        let successful = format!("{P}unicode_会话");
+        let failed = format!("{P}failed");
+        let names = [successful.as_str(), "unrelated", failed.as_str()];
+        let mut attempted = Vec::new();
+
+        let killed = stop_aoe_sessions(names.into_iter(), |name| {
+            attempted.push(name.to_string());
+            name == successful
+        });
+
+        assert_eq!(attempted, [successful, failed]);
+        assert_eq!(killed, 1);
     }
 
     #[cfg(unix)]
